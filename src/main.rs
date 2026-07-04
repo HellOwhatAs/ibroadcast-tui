@@ -3,6 +3,7 @@ mod app;
 mod config;
 mod downloads;
 mod error;
+mod hls;
 mod library;
 mod oauth;
 mod player;

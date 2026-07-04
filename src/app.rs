@@ -24,6 +24,7 @@ use crate::{
         remove_empty_download_dirs, stream_to_buffer,
     },
     error::{AppError, Result},
+    hls::stream_hls_to_buffer,
     library::{Library, Track},
     oauth::{self, DeviceCode, TokenSet},
     player::{AudioOutput, StreamSource, decode_progressive_stream},
@@ -133,6 +134,7 @@ enum BackendEvent {
     StreamResolved {
         generation: u64,
         track: Box<Track>,
+        bitrate: Bitrate,
         result: Result<String>,
     },
     /// The stream's container format was probed and a decoder built.
@@ -400,7 +402,9 @@ impl App {
         match self.active_view {
             View::Library => {
                 if let Some(track_id) = self.selected_library_track_id() {
-                    let index = self.queue.enqueue(track_id);
+                    // Tracks are queued at most once; activating an already
+                    // queued track jumps to its existing entry.
+                    let (index, _) = self.queue.enqueue(track_id);
                     self.queue_selected = index;
                     self.queue.play_index(index);
                     self.start_playback_current();
@@ -419,19 +423,28 @@ impl App {
             return;
         }
 
-        let added = if all_visible {
+        let (candidates, added) = if all_visible {
             let Some(ctx) = &self.session else { return };
-            self.queue
-                .enqueue_many(ctx.filtered_track_ids.iter().copied())
+            (
+                ctx.filtered_track_ids.len(),
+                self.queue
+                    .enqueue_many(ctx.filtered_track_ids.iter().copied()),
+            )
         } else if let Some(track_id) = self.selected_library_track_id() {
-            self.queue.enqueue(track_id);
-            1
+            (1, usize::from(self.queue.enqueue(track_id).1))
         } else {
-            0
+            (0, 0)
         };
 
-        self.status_line = if added == 0 {
+        self.status_line = if candidates == 0 {
             "No tracks to add".to_owned()
+        } else if added == 0 {
+            "Already in queue".to_owned()
+        } else if added < candidates {
+            format!(
+                "Added {added} track(s) to queue ({} already queued)",
+                candidates - added
+            )
         } else {
             format!("Added {added} track(s) to queue")
         };
@@ -561,7 +574,9 @@ impl App {
     }
 
     fn cycle_download_bitrate(&mut self) {
-        self.config.download_bitrate = self.config.download_bitrate.next();
+        // Downloads only cycle through the bitrates the server stores as
+        // complete files; the others exist solely as HLS streams.
+        self.config.download_bitrate = self.config.download_bitrate.next_download();
         self.status_line = match self.config.save() {
             Ok(()) => format!("Download bitrate set to {}", self.config.download_bitrate),
             Err(err) => format!(
@@ -626,6 +641,7 @@ impl App {
             let _ = tx.send(BackendEvent::StreamResolved {
                 generation,
                 track: Box::new(track),
+                bitrate,
                 result,
             });
         });
@@ -667,7 +683,11 @@ impl App {
     /// transfer into the progressive buffer, and probes/decodes the container
     /// on a blocking thread (probing blocks until enough bytes arrive, so it
     /// must stay off the UI event loop).
-    fn begin_stream(&mut self, generation: u64, track: Track, url: String) {
+    ///
+    /// Transcoded bitrates arrive as HLS playlists whose segments are demuxed
+    /// into a raw ADTS AAC stream; 128 kbps and the original format are plain
+    /// progressive files.
+    fn begin_stream(&mut self, generation: u64, track: Track, bitrate: Bitrate, url: String) {
         let label = self
             .session
             .as_ref()
@@ -680,7 +700,18 @@ impl App {
         let feeder_buffer = buffer.clone();
         let feeder_tx = self.tx.clone();
         let handle = tokio::spawn(async move {
-            if let Err(err) = stream_to_buffer(&http, &url, feeder_buffer.clone()).await {
+            let result = if bitrate.is_hls_stream() {
+                stream_hls_to_buffer(
+                    &http,
+                    &url,
+                    bitrate.target_bandwidth(),
+                    feeder_buffer.clone(),
+                )
+                .await
+            } else {
+                stream_to_buffer(&http, &url, feeder_buffer.clone()).await
+            };
+            if let Err(err) = result {
                 let error = err.to_string();
                 feeder_buffer.fail(error.clone());
                 let _ = feeder_tx.send(BackendEvent::StreamInterrupted { generation, error });
@@ -688,13 +719,19 @@ impl App {
         });
         self.stream_task = Some(StreamTask { handle, buffer });
 
+        let (mime_type, extension_hint) = if bitrate.is_hls_stream() {
+            // The HLS feeder emits a raw ADTS AAC stream, whatever the
+            // track's own container is.
+            ("audio/aac".to_owned(), "aac".to_owned())
+        } else {
+            (
+                track.mime_type.clone(),
+                extension_from_mime(&track.mime_type).to_owned(),
+            )
+        };
         let tx = self.tx.clone();
         tokio::task::spawn_blocking(move || {
-            let result = decode_progressive_stream(
-                reader,
-                &track.mime_type,
-                extension_from_mime(&track.mime_type),
-            );
+            let result = decode_progressive_stream(reader, &mime_type, &extension_hint);
             let _ = tx.send(BackendEvent::StreamDecoded {
                 generation,
                 label,
@@ -932,6 +969,7 @@ impl App {
             BackendEvent::StreamResolved {
                 generation,
                 track,
+                bitrate,
                 result,
             } => {
                 // Discard events for playback intents that were superseded.
@@ -941,7 +979,7 @@ impl App {
                     return;
                 }
                 match result {
-                    Ok(url) => self.begin_stream(generation, *track, url),
+                    Ok(url) => self.begin_stream(generation, *track, bitrate, url),
                     Err(err) => {
                         self.playback = PlaybackPhase::Idle;
                         self.status_line = format!("Stream failed: {err}");

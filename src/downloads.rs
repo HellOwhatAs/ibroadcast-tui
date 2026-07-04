@@ -7,7 +7,7 @@ use futures_util::StreamExt;
 use tokio::{fs, io::AsyncWriteExt};
 
 use crate::{
-    error::Result,
+    error::{AppError, Result},
     library::{Library, Track},
     progressive::ProgressiveBuffer,
 };
@@ -160,8 +160,18 @@ pub async fn stream_to_buffer(
     let response = http.get(url).send().await?.error_for_status()?;
     buffer.set_content_len(response.content_length());
     let mut stream = response.bytes_stream();
+    let mut total_bytes = 0usize;
     while let Some(chunk) = stream.next().await {
-        buffer.push(&chunk?);
+        let chunk = chunk?;
+        total_bytes += chunk.len();
+        buffer.push(&chunk);
+    }
+    // The streaming server reports some failures (e.g. rejected auth) as an
+    // empty 200 response; surface that instead of a cryptic decode error.
+    if total_bytes == 0 {
+        return Err(AppError::Playback(
+            "server returned an empty stream".to_owned(),
+        ));
     }
     buffer.finish();
     Ok(())

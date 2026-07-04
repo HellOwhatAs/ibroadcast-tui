@@ -225,8 +225,12 @@ impl ApiClient {
 }
 
 impl StreamContext {
+    /// Builds the signed URL for a track. For 128 kbps and the original
+    /// format this is a direct file URL; for the transcoded bitrates it is an
+    /// HLS playlist URL (`/hls_<rate>/...`), which is the only form the
+    /// server provides them in.
     pub fn build_stream_url(&self, track: &Track, bitrate: Bitrate) -> Result<String> {
-        let path = track_file_with_bitrate(&track.file, bitrate)?;
+        let path = track_file_with_segment(&track.file, bitrate.stream_path_segment())?;
         let file_id = file_id_from_track_file(&track.file)?;
         let expires = Utc::now().timestamp_millis();
         Ok(format!(
@@ -243,7 +247,7 @@ impl StreamContext {
     }
 }
 
-fn track_file_with_bitrate(track_file: &str, bitrate: Bitrate) -> Result<String> {
+fn track_file_with_segment(track_file: &str, segment: &str) -> Result<String> {
     let trimmed = track_file.trim_matches('/');
     let mut parts: Vec<&str> = trimmed.split('/').filter(|part| !part.is_empty()).collect();
     if parts.len() < 2 {
@@ -251,7 +255,7 @@ fn track_file_with_bitrate(track_file: &str, bitrate: Bitrate) -> Result<String>
             "invalid track file path: {track_file}"
         )));
     }
-    parts[0] = bitrate.as_path_segment();
+    parts[0] = segment;
     Ok(format!("/{}", parts.join("/")))
 }
 
@@ -283,17 +287,27 @@ mod tests {
 
     use crate::{config::Bitrate, library::Track};
 
-    use super::{StreamContext, file_id_from_track_file, track_file_with_bitrate};
+    use super::{StreamContext, file_id_from_track_file, track_file_with_segment};
 
     #[test]
     fn rewrites_track_file_bitrate() {
         assert_eq!(
-            track_file_with_bitrate("/128/d0c/6f4/21127414", Bitrate::Kbps320).unwrap(),
-            "/320/d0c/6f4/21127414"
+            track_file_with_segment("/128/d0c/6f4/21127414", Bitrate::Kbps320.stream_path_segment())
+                .unwrap(),
+            "/hls_320/d0c/6f4/21127414"
         );
         assert_eq!(
-            track_file_with_bitrate("/128/d0c/6f4/21127414", Bitrate::Original).unwrap(),
+            track_file_with_segment(
+                "/128/d0c/6f4/21127414",
+                Bitrate::Original.stream_path_segment()
+            )
+            .unwrap(),
             "/orig/d0c/6f4/21127414"
+        );
+        assert_eq!(
+            track_file_with_segment("/128/d0c/6f4/21127414", Bitrate::Kbps128.stream_path_segment())
+                .unwrap(),
+            "/128/d0c/6f4/21127414"
         );
     }
 

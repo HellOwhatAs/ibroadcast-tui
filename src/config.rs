@@ -86,6 +86,10 @@ impl Bitrate {
         Self::Original,
     ];
 
+    /// The bitrates the server stores as complete downloadable files. All
+    /// other bitrates exist only as HLS segment streams.
+    pub const DOWNLOAD_VALUES: [Self; 2] = [Self::Kbps128, Self::Original];
+
     pub fn as_path_segment(self) -> &'static str {
         match self {
             Self::Kbps96 => "96",
@@ -94,6 +98,57 @@ impl Bitrate {
             Self::Kbps256 => "256",
             Self::Kbps320 => "320",
             Self::Original => "orig",
+        }
+    }
+
+    /// Path segment used when building a streaming URL. The server only
+    /// serves complete files at 128 kbps and in the original format; the
+    /// transcoded bitrates are published as HLS playlists, exactly like the
+    /// official web player requests them.
+    pub fn stream_path_segment(self) -> &'static str {
+        match self {
+            Self::Kbps96 => "hls_96",
+            Self::Kbps128 => "128",
+            Self::Kbps192 => "hls_192",
+            Self::Kbps256 => "hls_256",
+            Self::Kbps320 => "hls_320",
+            Self::Original => "orig",
+        }
+    }
+
+    /// True when streaming this bitrate goes through an HLS playlist rather
+    /// than a single progressive file.
+    pub fn is_hls_stream(self) -> bool {
+        !matches!(self, Self::Kbps128 | Self::Original)
+    }
+
+    /// Target bandwidth in bits per second, used to pick a variant from an
+    /// HLS master playlist.
+    pub fn target_bandwidth(self) -> u64 {
+        match self {
+            Self::Kbps96 => 96_000,
+            Self::Kbps128 => 128_000,
+            Self::Kbps192 => 192_000,
+            Self::Kbps256 => 256_000,
+            Self::Kbps320 => 320_000,
+            Self::Original => u64::MAX,
+        }
+    }
+
+    /// Maps a bitrate to one the server can serve as a complete file:
+    /// transcoded bitrates fall back to 128 kbps.
+    pub fn nearest_download(self) -> Self {
+        if Self::DOWNLOAD_VALUES.contains(&self) {
+            self
+        } else {
+            Self::Kbps128
+        }
+    }
+
+    pub fn next_download(self) -> Self {
+        match self {
+            Self::Kbps128 => Self::Original,
+            _ => Self::Kbps128,
         }
     }
 
@@ -156,7 +211,10 @@ impl Config {
                 .or(file.download_dir)
                 .unwrap_or_else(default_download_dir),
             playback_bitrate: cli.bitrate.or(file.playback_bitrate),
-            download_bitrate: file.download_bitrate.unwrap_or(Bitrate::Original),
+            download_bitrate: file
+                .download_bitrate
+                .unwrap_or(Bitrate::Original)
+                .nearest_download(),
             plain_token_file: file.plain_token_file.unwrap_or(false),
         })
     }
@@ -228,5 +286,26 @@ mod tests {
             bitrate = bitrate.next();
             assert_eq!(bitrate, expected);
         }
+    }
+
+    #[test]
+    fn transcoded_bitrates_stream_over_hls() {
+        assert!(Bitrate::Kbps96.is_hls_stream());
+        assert!(Bitrate::Kbps320.is_hls_stream());
+        assert!(!Bitrate::Kbps128.is_hls_stream());
+        assert!(!Bitrate::Original.is_hls_stream());
+        assert_eq!(Bitrate::Kbps192.stream_path_segment(), "hls_192");
+        assert_eq!(Bitrate::Kbps128.stream_path_segment(), "128");
+        assert_eq!(Bitrate::Original.stream_path_segment(), "orig");
+    }
+
+    #[test]
+    fn download_bitrates_are_limited_to_complete_files() {
+        assert_eq!(Bitrate::Kbps96.nearest_download(), Bitrate::Kbps128);
+        assert_eq!(Bitrate::Kbps320.nearest_download(), Bitrate::Kbps128);
+        assert_eq!(Bitrate::Kbps128.nearest_download(), Bitrate::Kbps128);
+        assert_eq!(Bitrate::Original.nearest_download(), Bitrate::Original);
+        assert_eq!(Bitrate::Kbps128.next_download(), Bitrate::Original);
+        assert_eq!(Bitrate::Original.next_download(), Bitrate::Kbps128);
     }
 }

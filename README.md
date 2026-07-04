@@ -8,8 +8,9 @@ Cross-platform Rust TUI client for iBroadcast.
 - Token persistence through the system keyring, with a local fallback token file.
 - iBroadcast library sync and compressed `map` decoding.
 - Track browsing and search.
-- Playback queue with play, pause, previous, next, volume controls, and automatic advance to the next queued track.
+- Playback queue with play, pause, previous, next, volume controls, and automatic advance to the next queued track. Tracks are queued at most once; re-adding one jumps to its existing entry.
 - Low-latency progressive playback through an in-memory buffer; playback does not write audio to disk.
+- All streaming bitrates: 128 kbps and `orig` stream as plain files, while 96/192/256/320 kbps use the server's HLS endpoints (MPEG-TS segments demuxed to AAC in-process), the same way the official web player requests them.
 - Single-track and visible-list downloads integrated into the Library view.
 - Streaming URL generation from official iBroadcast `Streaming` API rules.
 - Network work runs in background tasks; the UI never blocks on the network, and network errors surface in the status line instead of exiting the app.
@@ -53,8 +54,8 @@ The developer page also generates a `client_secret`; most device-code setups onl
 
 - `client_id`: saved after the first login.
 - `download_dir`: defaults to your Music (or Downloads) folder under `iBroadcast/`.
-- `playback_bitrate`: `"96"` / `"128"` / `"192"` / `"256"` / `"320"` / `"orig"`. When omitted, the account preference reported by the iBroadcast server is used.
-- `download_bitrate`: same values; defaults to `"orig"`.
+- `playback_bitrate`: `"96"` / `"128"` / `"192"` / `"256"` / `"320"` / `"orig"`. When omitted, the account preference reported by the iBroadcast server is used. Bitrates other than 128 kbps and `orig` require an iBroadcast Premium account.
+- `download_bitrate`: `"128"` or `"orig"` (the only formats the server stores as complete files); defaults to `"orig"`. Other values fall back to `"128"`.
 - `plain_token_file`: set `true` to skip the keyring and use only the fallback token file.
 
 ## Keys
@@ -92,3 +93,4 @@ Playback is progressive and diskless, but the current decoder path keeps already
 - `library.rs`: library model and compressed `map` decoding.
 - `downloads.rs`: download transfers plus a `DownloadManager` that keeps the local-file index in memory, so rendering never touches the filesystem.
 - `player.rs` / `progressive.rs`: rodio output wrapper with end-of-track detection, and the blocking in-memory buffer that adapts async downloads to the decoder's `Read + Seek`. Container probing for streams runs on a blocking thread, so a stalled connection never freezes the UI.
+- `hls.rs`: minimal HLS client for the transcoded bitrates: playlist parsing, variant selection, and MPEG-TS demuxing into the raw ADTS AAC stream that feeds the progressive buffer. Polls the playlist while the server is still transcoding (`EXT-X-PLAYLIST-TYPE: EVENT`).
