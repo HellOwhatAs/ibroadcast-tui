@@ -1,0 +1,31 @@
+[package]
+name = "ibroadcast-tui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+description = "Cross-platform terminal client for iBroadcast"
+
+[dependencies]
+chrono = { version = "0.4", features = ["clock", "serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+crossterm = "0.29"
+dirs = "6"
+futures-util = "0.3"
+keyring = "3"
+ratatui = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["gzip", "json", "rustls-tls", "stream"] }
+rodio = { version = "0.22", default-features = false, features = ["playback", "symphonia-all"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+symphonia = { version = "0.5.5", features = ["aac", "alac", "flac", "isomp4", "mp3", "ogg", "vorbis", "wav"] }
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+urlencoding = "2"
+
+[dev-dependencies]
+pretty_assertions = "1"

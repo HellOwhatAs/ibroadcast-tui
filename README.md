@@ -1,0 +1,73 @@
+# ibroadcast-tui
+
+Cross-platform Rust TUI client for iBroadcast.
+
+## Features
+
+- OAuth 2 device-code login.
+- Token persistence through the system keyring, with a local fallback token file.
+- iBroadcast library sync and compressed `map` decoding.
+- Track browsing and search.
+- Playback queue with play, pause, previous, next, and volume controls.
+- Low-latency progressive playback through an in-memory buffer; playback does not write audio to disk.
+- Single-track and visible-list downloads integrated into the Library view.
+- Streaming URL generation from official iBroadcast `Streaming` API rules.
+
+## Run
+
+```powershell
+cargo run -- --client-id <your_ibroadcast_client_id>
+```
+
+You can also set `IBROADCAST_CLIENT_ID`. If your iBroadcast developer app
+requires a secret, set `IBROADCAST_CLIENT_SECRET` as well. The secret is used
+only at runtime and is not written to `config.toml`.
+
+Useful options:
+
+```powershell
+cargo run -- --download-dir C:\Music\iBroadcast --bitrate 320 --log-level info
+```
+
+The first launch asks you to authorize the app in a browser. Configuration is saved under the system config directory in `ibroadcast-tui/config.toml`.
+Tokens are saved to the system keyring when possible and also to `ibroadcast-tui/tokens` as a fallback so login survives keyring read failures. The fallback token file is sensitive; use `L` in the TUI to log out and delete it.
+
+## Getting a Client ID
+
+You do not need to write code to get a `client_id`:
+
+1. Open `https://media.ibroadcast.com/` and sign in.
+2. Open the side menu.
+3. Click `Apps`.
+4. Click `developer` near the bottom.
+5. Create a new app and copy the generated `client_id`.
+
+The TUI uses OAuth device-code login after that, so your account password is entered only on iBroadcast's website, not in this terminal app.
+For token polling, the client tries the RFC 8628 device-code grant type and falls back to iBroadcast's documented `device_code` value if the server rejects the first form.
+The developer page also generates a `client_secret`; most device-code setups only need the `client_id`, but this client can send the secret when `IBROADCAST_CLIENT_SECRET` or `--client-secret` is provided. A misspelled `IBEOADCAST_CLIENT_SECRET` environment variable is accepted for compatibility, but the correctly spelled name is preferred.
+
+## Keys
+
+- `/`: search
+- `Enter`: play selected item; local files are preferred when present
+- `a`: add selected Library track to Queue
+- `A`: add all visible Library tracks to Queue
+- `x` / `Delete`: delete selected local Library file, or remove selected Queue item
+- `[` / `]`: move selected Queue item up / down
+- `C`: clear Queue
+- `Space`: pause/resume
+- `n` / `p`: next / previous
+- `b`: cycle playback bitrate
+- `B`: cycle download bitrate
+- `d`: download selected track
+- `D`: download all visible tracks
+- `L`: logout and revoke the stored token
+- `+` / `-`: volume
+- `Tab`: switch between Library and Queue
+- `q`: quit
+
+## Scope
+
+This v1 is read-only for the music library. Uploads, ratings, tag editing, playlist editing, remote queue sync, and in-terminal artwork are intentionally left for later.
+
+Playback is progressive and diskless, but the current decoder path keeps already-downloaded bytes in memory so `rodio` can satisfy its `Read + Seek` requirement. This avoids cache files and lowers first-play latency, at the cost of using up to roughly one track's worth of RAM while that track is playing.
