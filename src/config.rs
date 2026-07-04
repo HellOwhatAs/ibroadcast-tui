@@ -1,5 +1,5 @@
 use std::{
-    env, fmt, fs,
+    fmt, fs,
     path::{Path, PathBuf},
 };
 
@@ -11,41 +11,49 @@ use crate::error::Result;
 #[derive(Debug, Parser)]
 #[command(version, about)]
 pub struct Cli {
+    /// iBroadcast OAuth client id.
     #[arg(long, env = "IBROADCAST_CLIENT_ID", hide_env_values = true)]
     pub client_id: Option<String>,
+    /// OAuth client secret, if your iBroadcast app requires one. Never persisted.
     #[arg(long, env = "IBROADCAST_CLIENT_SECRET", hide_env_values = true)]
     pub client_secret: Option<String>,
     #[arg(long)]
     pub download_dir: Option<PathBuf>,
+    /// Playback bitrate. Overrides the account preference reported by the server.
     #[arg(long, value_enum)]
     pub bitrate: Option<Bitrate>,
     #[arg(long, default_value = "warn")]
     pub log_level: String,
 }
 
-#[derive(Clone, Debug)]
-pub struct ConfigPaths {
-    pub config_dir: PathBuf,
-    pub config_file: PathBuf,
+/// On-disk configuration. Every field is optional so that an absent value can
+/// fall back to a default without inspecting the raw file text.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+struct ConfigFile {
+    client_id: Option<String>,
+    download_dir: Option<PathBuf>,
+    playback_bitrate: Option<Bitrate>,
+    download_bitrate: Option<Bitrate>,
+    plain_token_file: Option<bool>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default)]
-pub struct AppConfig {
+/// Resolved runtime configuration.
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub config_dir: PathBuf,
+    config_file: PathBuf,
     pub client_id: Option<String>,
-    #[serde(skip)]
+    /// Runtime-only; never written to disk.
     pub client_secret: Option<String>,
     pub download_dir: PathBuf,
-    pub playback_bitrate: Bitrate,
+    /// `None` means "follow the account preference reported by the server".
+    pub playback_bitrate: Option<Bitrate>,
     pub download_bitrate: Bitrate,
-    pub cache_dir: PathBuf,
     pub plain_token_file: bool,
-    #[serde(skip)]
-    pub playback_bitrate_explicit: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
-#[serde(rename_all = "lowercase")]
 pub enum Bitrate {
     #[serde(rename = "96")]
     #[value(name = "96")]
@@ -115,86 +123,63 @@ impl fmt::Display for Bitrate {
     }
 }
 
-impl Default for AppConfig {
-    fn default() -> Self {
-        let app_data = dirs::data_dir()
-            .unwrap_or_else(fallback_base_dir)
-            .join("ibroadcast-tui");
-        let cache_dir = dirs::cache_dir()
-            .unwrap_or_else(|| app_data.join("cache"))
-            .join("ibroadcast-tui");
-        let download_dir = dirs::audio_dir()
-            .or_else(dirs::download_dir)
-            .unwrap_or_else(|| app_data.join("downloads"))
-            .join("iBroadcast");
-
-        Self {
-            client_id: None,
-            client_secret: None,
-            download_dir,
-            playback_bitrate: Bitrate::Kbps128,
-            download_bitrate: Bitrate::Original,
-            cache_dir,
-            plain_token_file: false,
-            playback_bitrate_explicit: false,
-        }
-    }
-}
-
-impl AppConfig {
-    pub fn load(cli: &Cli) -> Result<(Self, ConfigPaths)> {
+impl Config {
+    pub fn load(cli: &Cli) -> Result<Self> {
         let config_dir = dirs::config_dir()
             .unwrap_or_else(fallback_base_dir)
             .join("ibroadcast-tui");
         let config_file = config_dir.join("config.toml");
 
-        let (mut config, config_had_playback_bitrate) = if config_file.exists() {
-            let text = fs::read_to_string(&config_file)?;
-            let mut config: Self = toml::from_str(&text)?;
-            let explicit = text.contains("playback_bitrate");
-            config.playback_bitrate_explicit = explicit;
-            (config, explicit)
+        let file: ConfigFile = if config_file.exists() {
+            toml::from_str(&fs::read_to_string(&config_file)?)?
         } else {
-            (Self::default(), false)
+            ConfigFile::default()
         };
-        config.playback_bitrate_explicit = config_had_playback_bitrate;
 
-        if let Some(client_id) = cli
-            .client_id
-            .as_ref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            config.client_id = Some(client_id.trim().to_owned());
-        }
-        config.client_secret = cli
-            .client_secret
-            .as_deref()
-            .and_then(nonempty_trimmed)
-            .map(str::to_owned)
-            .or_else(|| env_secret("IBEOADCAST_CLIENT_SECRET"));
-        if let Some(download_dir) = &cli.download_dir {
-            config.download_dir = download_dir.clone();
-        }
-        if let Some(bitrate) = cli.bitrate {
-            config.playback_bitrate = bitrate;
-            config.playback_bitrate_explicit = true;
-        }
-
-        Ok((
-            config,
-            ConfigPaths {
-                config_dir,
-                config_file,
-            },
-        ))
+        Ok(Self {
+            config_dir,
+            config_file,
+            client_id: cli
+                .client_id
+                .as_deref()
+                .and_then(nonempty_trimmed)
+                .map(str::to_owned)
+                .or(file.client_id),
+            client_secret: cli
+                .client_secret
+                .as_deref()
+                .and_then(nonempty_trimmed)
+                .map(str::to_owned),
+            download_dir: cli
+                .download_dir
+                .clone()
+                .or(file.download_dir)
+                .unwrap_or_else(default_download_dir),
+            playback_bitrate: cli.bitrate.or(file.playback_bitrate),
+            download_bitrate: file.download_bitrate.unwrap_or(Bitrate::Original),
+            plain_token_file: file.plain_token_file.unwrap_or(false),
+        })
     }
 
-    pub fn save(&self, paths: &ConfigPaths) -> Result<()> {
-        fs::create_dir_all(&paths.config_dir)?;
-        let text = toml::to_string_pretty(self)?;
-        fs::write(&paths.config_file, text)?;
+    pub fn save(&self) -> Result<()> {
+        let file = ConfigFile {
+            client_id: self.client_id.clone(),
+            download_dir: Some(self.download_dir.clone()),
+            playback_bitrate: self.playback_bitrate,
+            download_bitrate: Some(self.download_bitrate),
+            plain_token_file: Some(self.plain_token_file),
+        };
+        fs::create_dir_all(&self.config_dir)?;
+        fs::write(&self.config_file, toml::to_string_pretty(&file)?)?;
         Ok(())
     }
+}
+
+fn default_download_dir() -> PathBuf {
+    dirs::audio_dir()
+        .or_else(dirs::download_dir)
+        .unwrap_or_else(fallback_base_dir)
+        .join("iBroadcast")
 }
 
 fn fallback_base_dir() -> PathBuf {
@@ -206,8 +191,42 @@ fn nonempty_trimmed(value: &str) -> Option<&str> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
-fn env_secret(name: &str) -> Option<String> {
-    env::var(name)
-        .ok()
-        .and_then(|value| nonempty_trimmed(&value).map(str::to_owned))
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::{Bitrate, ConfigFile};
+
+    #[test]
+    fn config_files_written_by_older_versions_still_parse() {
+        // Older versions always wrote every field plus a `cache_dir`.
+        let text = r#"
+            client_id = "abc"
+            download_dir = "C:\\Music"
+            playback_bitrate = "128"
+            download_bitrate = "orig"
+            cache_dir = "C:\\Cache"
+            plain_token_file = false
+        "#;
+        let file: ConfigFile = toml::from_str(text).unwrap();
+        assert_eq!(file.client_id.as_deref(), Some("abc"));
+        assert_eq!(file.playback_bitrate, Some(Bitrate::Kbps128));
+        assert_eq!(file.download_bitrate, Some(Bitrate::Original));
+    }
+
+    #[test]
+    fn missing_fields_stay_unset() {
+        let file: ConfigFile = toml::from_str("").unwrap();
+        assert_eq!(file.playback_bitrate, None);
+        assert_eq!(file.client_id, None);
+    }
+
+    #[test]
+    fn bitrates_cycle_through_all_values() {
+        let mut bitrate = Bitrate::Kbps96;
+        for expected in Bitrate::VALUES.into_iter().cycle().skip(1).take(6) {
+            bitrate = bitrate.next();
+            assert_eq!(bitrate, expected);
+        }
+    }
 }

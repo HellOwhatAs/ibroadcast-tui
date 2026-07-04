@@ -5,7 +5,7 @@ use std::{
 
 use keyring::Entry;
 
-use crate::{download::sanitize_component, error::Result, oauth::TokenSet};
+use crate::{downloads::sanitize_component, error::Result, oauth::TokenSet};
 
 const KEYRING_SERVICE: &str = "ibroadcast-tui";
 

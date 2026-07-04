@@ -2,7 +2,6 @@
 pub struct PlaybackQueue {
     tracks: Vec<u64>,
     current: Option<usize>,
-    paused: bool,
 }
 
 impl PlaybackQueue {
@@ -19,7 +18,6 @@ impl PlaybackQueue {
             return None;
         }
         self.current = Some(index);
-        self.paused = false;
         self.current_track()
     }
 
@@ -86,7 +84,6 @@ impl PlaybackQueue {
     pub fn clear(&mut self) {
         self.tracks.clear();
         self.current = None;
-        self.paused = false;
     }
 
     pub fn len(&self) -> usize {
@@ -108,19 +105,13 @@ impl PlaybackQueue {
             return None;
         }
         self.current = Some(next);
-        self.paused = false;
         self.current_track()
     }
 
     pub fn previous(&mut self) -> Option<u64> {
         let previous = self.current?.saturating_sub(1);
         self.current = Some(previous);
-        self.paused = false;
         self.current_track()
-    }
-
-    pub fn set_paused(&mut self, paused: bool) {
-        self.paused = paused;
     }
 }
 

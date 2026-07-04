@@ -1,13 +1,16 @@
 use chrono::Utc;
 use reqwest::Client;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use crate::{
-    config::{AppConfig, Bitrate},
+    config::Bitrate,
     error::{AppError, Result},
-    library::{Library, Track},
+    library::{Library, Track, value_to_u64},
     oauth::{self, TokenSet},
 };
+
+const CLIENT_NAME: &str = "ibroadcast-tui";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Debug)]
 pub struct ApiSettings {
@@ -60,17 +63,17 @@ pub struct LibraryResponse {
     pub settings: ApiSettings,
 }
 
+/// Authenticated JSON API client. Refreshes its token transparently; callers
+/// that persist tokens should compare [`ApiClient::token`] before and after
+/// calls (see `session::Session`).
 #[derive(Debug)]
 pub struct ApiClient {
     http: Client,
     client_id: String,
     client_secret: Option<String>,
     token: TokenSet,
-    client_name: String,
-    version: String,
     device_name: String,
     user_agent: String,
-    refreshed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -83,36 +86,28 @@ pub struct StreamContext {
 }
 
 impl ApiClient {
-    pub fn new(client_id: String, token: TokenSet, config: &AppConfig) -> Self {
-        let http = Client::new();
-        let client_name = "ibroadcast-tui".to_owned();
-        let version = env!("CARGO_PKG_VERSION").to_owned();
+    pub fn new(
+        http: Client,
+        client_id: String,
+        client_secret: Option<String>,
+        token: TokenSet,
+    ) -> Self {
         let device_name = std::env::var("COMPUTERNAME")
             .or_else(|_| std::env::var("HOSTNAME"))
             .unwrap_or_else(|_| "Terminal".to_owned());
-        let user_agent = format!("{client_name}/{version}");
 
         Self {
             http,
             client_id,
-            client_secret: config.client_secret.clone(),
+            client_secret,
             token,
-            client_name,
-            version,
             device_name,
-            user_agent,
-            refreshed: false,
+            user_agent: format!("{CLIENT_NAME}/{VERSION}"),
         }
     }
 
     pub fn token(&self) -> &TokenSet {
         &self.token
-    }
-
-    pub fn take_refreshed(&mut self) -> bool {
-        let refreshed = self.refreshed;
-        self.refreshed = false;
-        refreshed
     }
 
     pub async fn ensure_token(&mut self) -> Result<()> {
@@ -122,22 +117,20 @@ impl ApiClient {
         Ok(())
     }
 
-    pub async fn refresh_token(&mut self) -> Result<()> {
-        let token = oauth::refresh_access_token(
+    async fn refresh_token(&mut self) -> Result<()> {
+        self.token = oauth::refresh_access_token(
             &self.http,
             &self.client_id,
             self.client_secret.as_deref(),
             &self.token.refresh_token,
         )
         .await?;
-        self.token = token;
-        self.refreshed = true;
         Ok(())
     }
 
     pub async fn status(&mut self) -> Result<StatusResponse> {
         let value = self
-            .json_request("status", "https://api.ibroadcast.com/status", Map::new())
+            .json_request("status", "https://api.ibroadcast.com/status")
             .await?;
         Ok(StatusResponse {
             user_id: find_user_id(&value),
@@ -147,11 +140,7 @@ impl ApiClient {
 
     pub async fn get_bitrate_pref(&mut self) -> Result<Option<Bitrate>> {
         let value = self
-            .json_request(
-                "getbitratepref",
-                "https://api.ibroadcast.com/getbitratepref",
-                Map::new(),
-            )
+            .json_request("getbitratepref", "https://api.ibroadcast.com/getbitratepref")
             .await?;
         Ok(value
             .get("bitrate")
@@ -161,7 +150,7 @@ impl ApiClient {
 
     pub async fn sync_library(&mut self) -> Result<LibraryResponse> {
         let value = self
-            .json_request("library", "https://library.ibroadcast.com", Map::new())
+            .json_request("library", "https://library.ibroadcast.com")
             .await?;
         let library_value = value
             .get("library")
@@ -177,21 +166,18 @@ impl ApiClient {
             streaming_server: settings.streaming_server.trim_end_matches('/').to_owned(),
             access_token: self.token.access_token.clone(),
             user_id,
-            platform: self.client_name.clone(),
-            version: self.version.clone(),
+            platform: CLIENT_NAME.to_owned(),
+            version: VERSION.to_owned(),
         }
     }
 
-    async fn json_request(
-        &mut self,
-        mode: &str,
-        url: &str,
-        extra: Map<String, Value>,
-    ) -> Result<Value> {
+    async fn json_request(&mut self, mode: &str, url: &str) -> Result<Value> {
         self.ensure_token().await?;
-        let body = self.request_body(mode, extra);
+        let body = self.request_body(mode);
         let mut value = self.post_json(url, &body).await?;
 
+        // The API can report a stale token even when it has not expired
+        // locally; refresh once and retry.
         if value.get("authenticated").and_then(Value::as_bool) == Some(false) {
             self.refresh_token().await?;
             value = self.post_json(url, &body).await?;
@@ -208,16 +194,14 @@ impl ApiClient {
         Ok(value)
     }
 
-    fn request_body(&self, mode: &str, extra: Map<String, Value>) -> Value {
-        let mut body = Map::from_iter([
-            ("client".to_owned(), json!(self.client_name)),
-            ("version".to_owned(), json!(self.version)),
-            ("device_name".to_owned(), json!(self.device_name)),
-            ("user_agent".to_owned(), json!(self.user_agent)),
-            ("mode".to_owned(), json!(mode)),
-        ]);
-        body.extend(extra);
-        Value::Object(body)
+    fn request_body(&self, mode: &str) -> Value {
+        json!({
+            "client": CLIENT_NAME,
+            "version": VERSION,
+            "device_name": self.device_name,
+            "user_agent": self.user_agent,
+            "mode": mode,
+        })
     }
 
     async fn post_json(&self, url: &str, body: &Value) -> Result<Value> {
@@ -259,7 +243,7 @@ impl StreamContext {
     }
 }
 
-pub fn track_file_with_bitrate(track_file: &str, bitrate: Bitrate) -> Result<String> {
+fn track_file_with_bitrate(track_file: &str, bitrate: Bitrate) -> Result<String> {
     let trimmed = track_file.trim_matches('/');
     let mut parts: Vec<&str> = trimmed.split('/').filter(|part| !part.is_empty()).collect();
     if parts.len() < 2 {
@@ -271,7 +255,7 @@ pub fn track_file_with_bitrate(track_file: &str, bitrate: Bitrate) -> Result<Str
     Ok(format!("/{}", parts.join("/")))
 }
 
-pub fn file_id_from_track_file(track_file: &str) -> Result<u64> {
+fn file_id_from_track_file(track_file: &str) -> Result<u64> {
     track_file
         .trim_matches('/')
         .rsplit('/')
@@ -291,14 +275,6 @@ fn find_user_id(value: &Value) -> Option<u64> {
     .into_iter()
     .flatten()
     .find_map(value_to_u64)
-}
-
-fn value_to_u64(value: &Value) -> Option<u64> {
-    match value {
-        Value::Number(number) => number.as_u64(),
-        Value::String(value) => value.parse().ok(),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

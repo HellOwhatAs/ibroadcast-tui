@@ -4,81 +4,43 @@ use serde_json::{Map, Value};
 
 use crate::error::{AppError, Result};
 
+/// The subset of the iBroadcast library that this client consumes.
+///
+/// iBroadcast returns collections in a compressed form: each entity is an
+/// array of values plus a `map` object that names each array index. Decoding
+/// only extracts the fields modeled here; everything else is dropped.
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
 pub struct Library {
     pub tracks: BTreeMap<u64, Track>,
     pub albums: BTreeMap<u64, Album>,
     pub artists: BTreeMap<u64, Artist>,
-    pub playlists: BTreeMap<u64, Playlist>,
-    pub tags: BTreeMap<u64, Tag>,
-    pub status: Option<Value>,
-    pub expires: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
 pub struct Track {
     pub id: u64,
     pub track: i64,
-    pub year: i64,
     pub title: String,
     pub genre: String,
     pub length: i64,
     pub album_id: u64,
-    pub artwork_id: u64,
     pub artist_id: u64,
-    pub uploaded_on: String,
     pub trashed: bool,
-    pub size: u64,
     pub path: String,
-    pub rating: i64,
-    pub plays: i64,
     pub file: String,
     pub mime_type: String,
-    pub replay_gain: String,
 }
 
+/// Albums and artists are keyed by id in [`Library`]; only display data is
+/// stored on the values themselves.
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
 pub struct Album {
-    pub id: u64,
     pub name: String,
-    pub tracks: Vec<u64>,
-    pub artist_id: u64,
-    pub trashed: bool,
-    pub rating: i64,
-    pub year: i64,
-    pub disc: i64,
 }
 
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
 pub struct Artist {
-    pub id: u64,
     pub name: String,
-    pub tracks: Vec<u64>,
-    pub trashed: bool,
-    pub rating: i64,
-}
-
-#[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
-pub struct Playlist {
-    pub id: u64,
-    pub name: String,
-    pub tracks: Vec<u64>,
-    pub description: String,
-    pub system_created: bool,
-}
-
-#[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
-pub struct Tag {
-    pub id: u64,
-    pub name: String,
-    pub archived: bool,
-    pub tracks: Vec<u64>,
 }
 
 impl Library {
@@ -93,29 +55,17 @@ impl Library {
             .collect();
         let albums = decode_collection(root.get("albums"))
             .into_iter()
-            .map(|(id, fields)| (id, Album::from_fields(id, &fields)))
+            .map(|(id, fields)| (id, Album::from_fields(&fields)))
             .collect();
         let artists = decode_collection(root.get("artists"))
             .into_iter()
-            .map(|(id, fields)| (id, Artist::from_fields(id, &fields)))
-            .collect();
-        let playlists = decode_collection(root.get("playlists"))
-            .into_iter()
-            .map(|(id, fields)| (id, Playlist::from_fields(id, &fields)))
-            .collect();
-        let tags = decode_tags(root.get("tags"))
-            .into_iter()
-            .map(|(id, fields)| (id, Tag::from_fields(id, &fields)))
+            .map(|(id, fields)| (id, Artist::from_fields(&fields)))
             .collect();
 
         Ok(Self {
             tracks,
             albums,
             artists,
-            playlists,
-            tags,
-            status: root.get("status").cloned(),
-            expires: root.get("expires").and_then(value_to_i64),
         })
     }
 
@@ -206,22 +156,15 @@ impl Track {
         Self {
             id,
             track: get_i64(fields, "track"),
-            year: get_i64(fields, "year"),
             title: get_string(fields, "title", "Untitled"),
             genre: get_string(fields, "genre", ""),
             length: get_i64(fields, "length"),
             album_id: get_u64(fields, "album_id"),
-            artwork_id: get_u64(fields, "artwork_id"),
             artist_id: get_u64(fields, "artist_id"),
-            uploaded_on: get_string(fields, "uploaded_on", ""),
             trashed: get_bool(fields, "trashed"),
-            size: get_u64(fields, "size"),
             path: get_string(fields, "path", ""),
-            rating: get_i64(fields, "rating"),
-            plays: get_i64(fields, "plays"),
             file: get_string(fields, "file", ""),
             mime_type: get_string(fields, "type", ""),
-            replay_gain: get_string(fields, "replay_gain", ""),
         }
     }
 
@@ -233,55 +176,22 @@ impl Track {
 }
 
 impl Album {
-    fn from_fields(id: u64, fields: &Map<String, Value>) -> Self {
+    fn from_fields(fields: &Map<String, Value>) -> Self {
         Self {
-            id,
             name: get_string(fields, "name", "Unknown Album"),
-            tracks: get_vec_u64(fields, "tracks"),
-            artist_id: get_u64(fields, "artist_id"),
-            trashed: get_bool(fields, "trashed"),
-            rating: get_i64(fields, "rating"),
-            year: get_i64(fields, "year"),
-            disc: get_i64(fields, "disc"),
         }
     }
 }
 
 impl Artist {
-    fn from_fields(id: u64, fields: &Map<String, Value>) -> Self {
+    fn from_fields(fields: &Map<String, Value>) -> Self {
         Self {
-            id,
             name: get_string(fields, "name", "Unknown Artist"),
-            tracks: get_vec_u64(fields, "tracks"),
-            trashed: get_bool(fields, "trashed"),
-            rating: get_i64(fields, "rating"),
         }
     }
 }
 
-impl Playlist {
-    fn from_fields(id: u64, fields: &Map<String, Value>) -> Self {
-        Self {
-            id,
-            name: get_string(fields, "name", "Untitled Playlist"),
-            tracks: get_vec_u64(fields, "tracks"),
-            description: get_string(fields, "description", ""),
-            system_created: get_bool(fields, "system_created"),
-        }
-    }
-}
-
-impl Tag {
-    fn from_fields(id: u64, fields: &Map<String, Value>) -> Self {
-        Self {
-            id,
-            name: get_string(fields, "name", "Untitled Tag"),
-            archived: get_bool(fields, "archived"),
-            tracks: get_vec_u64(fields, "tracks"),
-        }
-    }
-}
-
+/// Decodes an iBroadcast compressed collection: `{ "<id>": [values...], "map": {field: index} }`.
 fn decode_collection(value: Option<&Value>) -> BTreeMap<u64, Map<String, Value>> {
     let Some(object) = value.and_then(Value::as_object) else {
         return BTreeMap::new();
@@ -312,21 +222,6 @@ fn decode_collection(value: Option<&Value>) -> BTreeMap<u64, Map<String, Value>>
         .collect()
 }
 
-fn decode_tags(value: Option<&Value>) -> BTreeMap<u64, Map<String, Value>> {
-    let Some(object) = value.and_then(Value::as_object) else {
-        return BTreeMap::new();
-    };
-
-    if object.get("map").is_some() {
-        return decode_collection(value);
-    }
-
-    object
-        .iter()
-        .filter_map(|(id, raw)| Some((id.parse::<u64>().ok()?, raw.as_object()?.clone())))
-        .collect()
-}
-
 fn get_string(fields: &Map<String, Value>, key: &str, default: &str) -> String {
     fields
         .get(key)
@@ -350,15 +245,7 @@ fn get_bool(fields: &Map<String, Value>, key: &str) -> bool {
     fields.get(key).and_then(Value::as_bool).unwrap_or_default()
 }
 
-fn get_vec_u64(fields: &Map<String, Value>, key: &str) -> Vec<u64> {
-    fields
-        .get(key)
-        .and_then(Value::as_array)
-        .map(|values| values.iter().filter_map(value_to_u64).collect())
-        .unwrap_or_default()
-}
-
-fn value_to_u64(value: &Value) -> Option<u64> {
+pub fn value_to_u64(value: &Value) -> Option<u64> {
     match value {
         Value::Number(number) => number.as_u64(),
         Value::String(value) => value.parse().ok(),
@@ -405,17 +292,33 @@ mod tests {
             "artists": {
                 "22917502": ["Zoe.LeelA", [211504300], false, 0],
                 "map": {"name": 0, "tracks": 1, "trashed": 2, "rating": 3}
-            },
-            "playlists": {},
-            "tags": {
-                "455976": {"name": "Test Tag", "archived": false, "tracks": [211504300]}
             }
         });
 
         let library = Library::from_value(&raw).unwrap();
         assert_eq!(library.tracks[&211504300].title, "Pop Up");
-        assert_eq!(library.albums[&78903103].tracks, vec![211504300]);
+        assert_eq!(library.tracks[&211504300].file, "/128/74c/fdd/10026629");
+        assert_eq!(library.albums[&78903103].name, "Digital Guilt");
         assert_eq!(library.artist_name(22917502), "Zoe.LeelA");
-        assert_eq!(library.tags[&455976].name, "Test Tag");
+    }
+
+    #[test]
+    fn search_matches_artist_and_title() {
+        let raw = json!({
+            "tracks": {
+                "1": ["Song A", 5, false, 10],
+                "2": ["Other", 5, false, 10],
+                "map": {"title": 0, "artist_id": 1, "trashed": 2, "album_id": 3}
+            },
+            "artists": {
+                "5": ["The Band"],
+                "map": {"name": 0}
+            },
+            "albums": {}
+        });
+        let library = Library::from_value(&raw).unwrap();
+        assert_eq!(library.search_track_ids("song"), vec![1]);
+        assert_eq!(library.search_track_ids("band").len(), 2);
+        assert_eq!(library.search_track_ids(""), vec![2, 1]); // "Other" < "Song A"
     }
 }

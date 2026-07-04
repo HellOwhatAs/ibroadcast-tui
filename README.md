@@ -8,10 +8,11 @@ Cross-platform Rust TUI client for iBroadcast.
 - Token persistence through the system keyring, with a local fallback token file.
 - iBroadcast library sync and compressed `map` decoding.
 - Track browsing and search.
-- Playback queue with play, pause, previous, next, and volume controls.
+- Playback queue with play, pause, previous, next, volume controls, and automatic advance to the next queued track.
 - Low-latency progressive playback through an in-memory buffer; playback does not write audio to disk.
 - Single-track and visible-list downloads integrated into the Library view.
 - Streaming URL generation from official iBroadcast `Streaming` API rules.
+- Network work runs in background tasks; the UI never blocks on the network, and network errors surface in the status line instead of exiting the app.
 
 ## Run
 
@@ -44,7 +45,17 @@ You do not need to write code to get a `client_id`:
 
 The TUI uses OAuth device-code login after that, so your account password is entered only on iBroadcast's website, not in this terminal app.
 For token polling, the client tries the RFC 8628 device-code grant type and falls back to iBroadcast's documented `device_code` value if the server rejects the first form.
-The developer page also generates a `client_secret`; most device-code setups only need the `client_id`, but this client can send the secret when `IBROADCAST_CLIENT_SECRET` or `--client-secret` is provided. A misspelled `IBEOADCAST_CLIENT_SECRET` environment variable is accepted for compatibility, but the correctly spelled name is preferred.
+The developer page also generates a `client_secret`; most device-code setups only need the `client_id`, but this client can send the secret when `IBROADCAST_CLIENT_SECRET` or `--client-secret` is provided. The secret is used only at runtime and is never written to `config.toml`.
+
+## Configuration
+
+`config.toml` lives in the system config directory under `ibroadcast-tui/`. All fields are optional:
+
+- `client_id`: saved after the first login.
+- `download_dir`: defaults to your Music (or Downloads) folder under `iBroadcast/`.
+- `playback_bitrate`: `"96"` / `"128"` / `"192"` / `"256"` / `"320"` / `"orig"`. When omitted, the account preference reported by the iBroadcast server is used.
+- `download_bitrate`: same values; defaults to `"orig"`.
+- `plain_token_file`: set `true` to skip the keyring and use only the fallback token file.
 
 ## Keys
 
@@ -71,3 +82,13 @@ The developer page also generates a `client_secret`; most device-code setups onl
 This v1 is read-only for the music library. Uploads, ratings, tag editing, playlist editing, remote queue sync, and in-terminal artwork are intentionally left for later.
 
 Playback is progressive and diskless, but the current decoder path keeps already-downloaded bytes in memory so `rodio` can satisfy its `Read + Seek` requirement. This avoids cache files and lowers first-play latency, at the cost of using up to roughly one track's worth of RAM while that track is playing.
+
+## Architecture
+
+- `app.rs`: controller. Owns the phase state machine (login -> authorize -> ready), maps keys to `Action`s, and reacts to `BackendEvent`s from background tasks. Input handling is fully synchronous; anything that touches the network is spawned and reports back through a channel. Stale playback events are discarded via a generation counter.
+- `ui.rs`: pure rendering over read-only view structs.
+- `session.rs`: an authenticated session (API client + account settings + user id). The single owner of token persistence: any call that may refresh the token syncs the token store afterwards. Shared with background tasks as `Arc<Mutex<Session>>`.
+- `api.rs` / `oauth.rs` / `storage.rs`: iBroadcast JSON API, device-code OAuth flow, and token storage (keyring with plain-file fallback).
+- `library.rs`: library model and compressed `map` decoding.
+- `downloads.rs`: download transfers plus a `DownloadManager` that keeps the local-file index in memory, so rendering never touches the filesystem.
+- `player.rs` / `progressive.rs`: rodio output wrapper with end-of-track detection, and the blocking in-memory buffer that adapts async downloads to the decoder's `Read + Seek`. Container probing for streams runs on a blocking thread, so a stalled connection never freezes the UI.

@@ -1,17 +1,19 @@
 mod api;
 mod app;
 mod config;
-mod download;
+mod downloads;
 mod error;
 mod library;
 mod oauth;
-mod playback;
+mod player;
 mod progressive;
 mod queue;
+mod session;
 mod storage;
+mod ui;
 
 use clap::Parser;
-use config::{AppConfig, Cli};
+use config::{Cli, Config};
 use error::Result;
 use storage::TokenStore;
 
@@ -20,10 +22,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_logging(&cli.log_level);
 
-    let (config, paths) = AppConfig::load(&cli)?;
-    let token_store = TokenStore::new(paths.config_dir.clone(), config.plain_token_file);
-    let app = app::App::new(config, paths, token_store);
-    app.run().await
+    let config = Config::load(&cli)?;
+    let token_store = TokenStore::new(config.config_dir.clone(), config.plain_token_file);
+    app::App::new(config, token_store).run().await
 }
 
 fn init_logging(level: &str) {

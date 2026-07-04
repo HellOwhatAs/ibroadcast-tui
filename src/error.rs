@@ -17,8 +17,6 @@ pub enum AppError {
     },
     #[error("invalid library response: {0}")]
     Library(String),
-    #[error("missing token; log in again")]
-    MissingToken,
     #[error("playback error: {0}")]
     Playback(String),
     #[error("http error: {0}")]
@@ -36,5 +34,12 @@ pub enum AppError {
 impl AppError {
     pub fn auth_response(status: reqwest::StatusCode, body: &str) -> Self {
         Self::Auth(format!("server returned {status}: {body}"))
+    }
+
+    pub fn download_path(path: PathBuf, source: AppError) -> Self {
+        Self::Download {
+            path,
+            source: Box::new(source),
+        }
     }
 }
