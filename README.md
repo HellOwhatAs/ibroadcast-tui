@@ -1,6 +1,6 @@
 # ibroadcast-tui
 
-Cross-platform Rust TUI client for iBroadcast.
+Cross-platform Rust TUI client for [iBroadcast](https://ibroadcast.com/).
 
 <img alt="image" src="https://github.com/user-attachments/assets/270eee1f-20b4-43b6-848b-13c18bf15d02" />
 
