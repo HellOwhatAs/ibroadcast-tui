@@ -56,32 +56,22 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package Unix binary
+      - name: Stage Unix binary
         if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
-          asset_stem="${BIN_NAME}-${TAG_NAME}-${{ matrix.target }}"
-          staging="dist/${asset_stem}"
-          mkdir -p "${staging}"
-          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "${staging}/"
-          cp README.md "${staging}/"
-          if [ -f LICENSE ]; then cp LICENSE "${staging}/"; fi
-          tar -C dist -czf "${asset_stem}.tar.gz" "${asset_stem}"
-          echo "ASSET_PATH=${asset_stem}.tar.gz" >> "${GITHUB_ENV}"
+          asset_path="${BIN_NAME}-${TAG_NAME}-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "${asset_path}"
+          echo "ASSET_PATH=${asset_path}" >> "${GITHUB_ENV}"
 
-      - name: Package Windows binary
+      - name: Stage Windows binary
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $assetStem = "${env:BIN_NAME}-${env:TAG_NAME}-${{ matrix.target }}"
-          $staging = "dist/$assetStem"
-          New-Item -ItemType Directory -Force -Path $staging | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/${env:BIN_NAME}${{ matrix.exe_ext }}" $staging
-          Copy-Item README.md $staging
-          if (Test-Path LICENSE) { Copy-Item LICENSE $staging }
-          $assetPath = "$assetStem.zip"
-          Compress-Archive -Path "$staging/*" -DestinationPath $assetPath -Force
+          $assetPath = "$assetStem${{ matrix.exe_ext }}"
+          Copy-Item "target/${{ matrix.target }}/release/${env:BIN_NAME}${{ matrix.exe_ext }}" $assetPath
           "ASSET_PATH=$assetPath" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload workflow artifact
