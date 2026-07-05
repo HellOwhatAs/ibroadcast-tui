@@ -160,6 +160,7 @@ pub fn ready_screen(frame: &mut Frame<'_>, screen: &ReadyScreen<'_>) {
         )),
     ])
     .block(Block::default().borders(Borders::ALL).title("Status"));
+    frame.render_widget(Clear, chunks[2]);
     frame.render_widget(status, chunks[2]);
 
     let help = if let Some(search) = screen.search_input {
@@ -167,6 +168,7 @@ pub fn ready_screen(frame: &mut Frame<'_>, screen: &ReadyScreen<'_>) {
     } else {
         help_for_view(screen.active_view).to_owned()
     };
+    frame.render_widget(Clear, chunks[3]);
     frame.render_widget(Paragraph::new(help), chunks[3]);
 
     if let Some(search) = screen.search_input {

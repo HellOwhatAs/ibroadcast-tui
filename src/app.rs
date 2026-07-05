@@ -161,6 +161,8 @@ impl App {
         let audio_warning = audio.is_none().then(|| {
             "No audio output device available; browsing and downloads still work".to_owned()
         });
+        let mut queue = PlaybackQueue::default();
+        queue.set_playback_mode(config.playback_mode);
 
         Self {
             config,
@@ -181,7 +183,7 @@ impl App {
             playback: PlaybackPhase::Idle,
             playback_generation: 0,
             stream_task: None,
-            queue: PlaybackQueue::default(),
+            queue,
             downloads: DownloadManager::default(),
             status_line: String::new(),
             should_quit: false,
@@ -586,7 +588,11 @@ impl App {
 
     fn cycle_playback_mode(&mut self) {
         let mode = self.queue.cycle_playback_mode();
-        self.status_line = format!("Playback mode set to {mode}");
+        self.config.playback_mode = mode;
+        self.status_line = match self.config.save() {
+            Ok(()) => format!("Playback mode set to {mode}"),
+            Err(err) => format!("Playback mode set to {mode}, but config save failed: {err}"),
+        };
     }
 
     // ---- playback -------------------------------------------------------

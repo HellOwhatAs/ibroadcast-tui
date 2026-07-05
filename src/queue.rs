@@ -1,8 +1,10 @@
 use std::fmt;
 
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PlaybackMode {
     #[default]
     Sequential,
@@ -55,9 +57,13 @@ impl PlaybackQueue {
     }
 
     pub fn cycle_playback_mode(&mut self) -> PlaybackMode {
-        self.mode = self.mode.next();
-        self.reset_shuffle();
+        self.set_playback_mode(self.mode.next());
         self.mode
+    }
+
+    pub fn set_playback_mode(&mut self, mode: PlaybackMode) {
+        self.mode = mode;
+        self.reset_shuffle();
     }
 
     pub fn current_index(&self) -> Option<usize> {

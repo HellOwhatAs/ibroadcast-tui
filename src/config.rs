@@ -6,7 +6,7 @@ use std::{
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
+use crate::{error::Result, queue::PlaybackMode};
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -34,6 +34,7 @@ struct ConfigFile {
     client_id: Option<String>,
     download_dir: Option<PathBuf>,
     playback_bitrate: Option<Bitrate>,
+    playback_mode: Option<PlaybackMode>,
     download_bitrate: Option<Bitrate>,
     plain_token_file: Option<bool>,
 }
@@ -49,6 +50,7 @@ pub struct Config {
     pub download_dir: PathBuf,
     /// `None` means "follow the account preference reported by the server".
     pub playback_bitrate: Option<Bitrate>,
+    pub playback_mode: PlaybackMode,
     pub download_bitrate: Bitrate,
     pub plain_token_file: bool,
 }
@@ -211,6 +213,7 @@ impl Config {
                 .or(file.download_dir)
                 .unwrap_or_else(default_download_dir),
             playback_bitrate: cli.bitrate.or(file.playback_bitrate),
+            playback_mode: file.playback_mode.unwrap_or_default(),
             download_bitrate: file
                 .download_bitrate
                 .unwrap_or(Bitrate::Original)
@@ -224,6 +227,7 @@ impl Config {
             client_id: self.client_id.clone(),
             download_dir: Some(self.download_dir.clone()),
             playback_bitrate: self.playback_bitrate,
+            playback_mode: Some(self.playback_mode),
             download_bitrate: Some(self.download_bitrate),
             plain_token_file: Some(self.plain_token_file),
         };
@@ -253,6 +257,8 @@ fn nonempty_trimmed(value: &str) -> Option<&str> {
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::queue::PlaybackMode;
+
     use super::{Bitrate, ConfigFile};
 
     #[test]
@@ -262,6 +268,7 @@ mod tests {
             client_id = "abc"
             download_dir = "C:\\Music"
             playback_bitrate = "128"
+            playback_mode = "shuffle"
             download_bitrate = "orig"
             cache_dir = "C:\\Cache"
             plain_token_file = false
@@ -269,6 +276,7 @@ mod tests {
         let file: ConfigFile = toml::from_str(text).unwrap();
         assert_eq!(file.client_id.as_deref(), Some("abc"));
         assert_eq!(file.playback_bitrate, Some(Bitrate::Kbps128));
+        assert_eq!(file.playback_mode, Some(PlaybackMode::Shuffle));
         assert_eq!(file.download_bitrate, Some(Bitrate::Original));
     }
 
@@ -276,6 +284,7 @@ mod tests {
     fn missing_fields_stay_unset() {
         let file: ConfigFile = toml::from_str("").unwrap();
         assert_eq!(file.playback_bitrate, None);
+        assert_eq!(file.playback_mode, None);
         assert_eq!(file.client_id, None);
     }
 

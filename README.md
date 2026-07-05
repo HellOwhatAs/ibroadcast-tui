@@ -34,6 +34,7 @@ cargo run -- --download-dir C:\Music\iBroadcast --bitrate 320 --log-level info
 ```
 
 The first launch asks you to authorize the app in a browser. Configuration is saved under the system config directory in `ibroadcast-tui/config.toml`.
+Warnings/errors, or the level set by `--log-level`, are written to `ibroadcast-tui/ibroadcast-tui.log` in that same config directory so background decoder logs cannot corrupt the terminal UI. The file is capped at roughly 1 MiB.
 Tokens are saved to the system keyring when possible and also to `ibroadcast-tui/tokens` as a fallback so login survives keyring read failures. The fallback token file is sensitive; use `L` in the TUI to log out and delete it.
 
 ## Getting a Client ID
@@ -57,6 +58,7 @@ The developer page also generates a `client_secret`; most device-code setups onl
 - `client_id`: saved after the first login.
 - `download_dir`: defaults to your Music (or Downloads) folder under `iBroadcast/`.
 - `playback_bitrate`: `"96"` / `"128"` / `"192"` / `"256"` / `"320"` / `"orig"`. When omitted, the account preference reported by the iBroadcast server is used. Bitrates other than 128 kbps and `orig` require an iBroadcast Premium account.
+- `playback_mode`: `"sequential"` / `"repeat_one"` / `"repeat_all"` / `"shuffle"`; defaults to `"sequential"`.
 - `download_bitrate`: `"128"` or `"orig"` (the only formats the server stores as complete files); defaults to `"orig"`. Other values fall back to `"128"`.
 - `plain_token_file`: set `true` to skip the keyring and use only the fallback token file.
 
