@@ -2,7 +2,7 @@
 
 Cross-platform Rust TUI client for [iBroadcast](https://ibroadcast.com/).
 
-<img alt="image" src="https://github.com/user-attachments/assets/270eee1f-20b4-43b6-848b-13c18bf15d02" />
+<img src="https://github.com/user-attachments/assets/f69eed05-d830-4996-8181-f25e04ebe5e6" />
 
 ## Features
 
