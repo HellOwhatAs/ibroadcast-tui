@@ -1,8 +1,4 @@
-use std::{
-    fs::File,
-    io::BufReader,
-    path::Path,
-};
+use std::{fs::File, io::BufReader, path::Path, time::Duration};
 
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player};
 
@@ -98,6 +94,14 @@ impl AudioOutput {
     /// True when a track was loaded and has played to completion.
     pub fn is_finished(&self) -> bool {
         self.player.as_ref().is_some_and(Player::empty)
+    }
+
+    pub fn is_paused(&self) -> Option<bool> {
+        self.player.as_ref().map(Player::is_paused)
+    }
+
+    pub fn position(&self) -> Option<Duration> {
+        self.player.as_ref().map(Player::get_pos)
     }
 
     pub fn stop(&mut self) {

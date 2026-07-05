@@ -1079,6 +1079,69 @@ impl App {
 
     // ---- rendering ---------------------------------------------------------
 
+    fn playback_summary(&self, library: &Library) -> ui::PlaybackSummary {
+        let state = self.playback_state();
+        let Some(track_id) = self.queue.current_track() else {
+            return ui::PlaybackSummary {
+                label: "Nothing playing".to_owned(),
+                state,
+                elapsed: None,
+                duration: None,
+            };
+        };
+
+        let label = library.track_label(track_id);
+        let Some(track) = library.tracks.get(&track_id) else {
+            return ui::PlaybackSummary {
+                label,
+                state,
+                elapsed: None,
+                duration: None,
+            };
+        };
+
+        let duration = Duration::from_secs(track.length.max(0) as u64);
+        let elapsed = match self.playback {
+            PlaybackPhase::Active => self
+                .audio
+                .as_ref()
+                .and_then(AudioOutput::position)
+                .unwrap_or_default(),
+            PlaybackPhase::Idle | PlaybackPhase::Loading => Duration::ZERO,
+        };
+        let elapsed = if duration == Duration::ZERO {
+            elapsed
+        } else {
+            elapsed.min(duration)
+        };
+
+        ui::PlaybackSummary {
+            label,
+            state,
+            elapsed: Some(elapsed),
+            duration: Some(duration),
+        }
+    }
+
+    fn playback_state(&self) -> ui::PlaybackState {
+        match self.playback {
+            PlaybackPhase::Idle => ui::PlaybackState::Stopped,
+            PlaybackPhase::Loading => ui::PlaybackState::Loading,
+            PlaybackPhase::Active => {
+                if self
+                    .audio
+                    .as_ref()
+                    .and_then(AudioOutput::is_paused)
+                    .unwrap_or(false)
+                {
+                    ui::PlaybackState::Paused
+                } else {
+                    ui::PlaybackState::Playing
+                }
+            }
+        }
+    }
+
     fn render(&self, frame: &mut Frame<'_>) {
         match &self.phase {
             Phase::NeedClientId => {
@@ -1116,10 +1179,7 @@ impl App {
                         active_view: self.active_view,
                         downloads: &self.downloads,
                         status_line: &self.status_line,
-                        now_playing: self
-                            .queue
-                            .current_track()
-                            .map(|track_id| ctx.library.track_label(track_id)),
+                        playback: self.playback_summary(&ctx.library),
                         playback_bitrate: self.effective_playback_bitrate(),
                         playback_mode: self.queue.playback_mode(),
                         download_bitrate: self.config.download_bitrate,

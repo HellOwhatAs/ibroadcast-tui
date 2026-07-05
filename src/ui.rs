@@ -8,6 +8,7 @@ use ratatui::{
         Wrap,
     },
 };
+use std::{fmt, time::Duration};
 
 use crate::{
     config::Bitrate,
@@ -33,12 +34,39 @@ pub struct ReadyScreen<'a> {
     pub active_view: View,
     pub downloads: &'a DownloadManager,
     pub status_line: &'a str,
-    pub now_playing: Option<String>,
+    pub playback: PlaybackSummary,
     pub playback_bitrate: Bitrate,
     pub playback_mode: PlaybackMode,
     pub download_bitrate: Bitrate,
     /// `Some` while the search prompt is open.
     pub search_input: Option<&'a str>,
+}
+
+pub struct PlaybackSummary {
+    pub label: String,
+    pub state: PlaybackState,
+    pub elapsed: Option<Duration>,
+    pub duration: Option<Duration>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaybackState {
+    Stopped,
+    Loading,
+    Playing,
+    Paused,
+}
+
+impl fmt::Display for PlaybackState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::Stopped => "Stopped",
+            Self::Loading => "Loading",
+            Self::Playing => "Playing",
+            Self::Paused => "Paused",
+        };
+        formatter.write_str(label)
+    }
 }
 
 pub fn login_screen(frame: &mut Frame<'_>, input: &str, status_line: &str) {
@@ -142,13 +170,9 @@ pub fn ready_screen(frame: &mut Frame<'_>, screen: &ReadyScreen<'_>) {
         View::Queue => draw_queue(frame, chunks[1], screen),
     }
 
-    let now_playing = screen
-        .now_playing
-        .clone()
-        .unwrap_or_else(|| "Nothing playing".to_owned());
     let status = Paragraph::new(vec![
         Line::from(screen.status_line),
-        Line::from(format!("Now: {now_playing}")),
+        Line::from(playback_status_line(&screen.playback)),
         Line::from(format!(
             "Mode: {} | Playback bitrate: {} | Download bitrate: {}",
             screen.playback_mode, screen.playback_bitrate, screen.download_bitrate
@@ -270,6 +294,30 @@ fn draw_search_popup(frame: &mut Frame<'_>, search: &str) {
     frame.render_widget(paragraph, area);
 }
 
+fn playback_status_line(playback: &PlaybackSummary) -> String {
+    let mut line = format!("Now: {} | {}", playback.label, playback.state);
+    if let (Some(elapsed), Some(duration)) = (playback.elapsed, playback.duration) {
+        line.push_str(&format!(
+            " | {} / {}",
+            duration_label(elapsed),
+            duration_label(duration)
+        ));
+    }
+    line
+}
+
+fn duration_label(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
 fn centered_paragraph<'a>(title: &'static str, lines: Vec<Line<'a>>) -> Paragraph<'a> {
     Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(title))
@@ -294,4 +342,41 @@ fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - width_percent) / 2),
         ])
         .split(vertical[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{PlaybackState, PlaybackSummary, playback_status_line};
+
+    #[test]
+    fn playback_line_includes_state_and_time() {
+        let playback = PlaybackSummary {
+            label: "Artist - Song".to_owned(),
+            state: PlaybackState::Playing,
+            elapsed: Some(Duration::from_secs(65)),
+            duration: Some(Duration::from_secs(189)),
+        };
+
+        assert_eq!(
+            playback_status_line(&playback),
+            "Now: Artist - Song | Playing | 1:05 / 3:09"
+        );
+    }
+
+    #[test]
+    fn playback_line_handles_missing_track() {
+        let playback = PlaybackSummary {
+            label: "Nothing playing".to_owned(),
+            state: PlaybackState::Stopped,
+            elapsed: None,
+            duration: None,
+        };
+
+        assert_eq!(
+            playback_status_line(&playback),
+            "Now: Nothing playing | Stopped"
+        );
+    }
 }
