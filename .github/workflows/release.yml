@@ -1,0 +1,103 @@
+name: Release binaries
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  BIN_NAME: ibroadcast-tui
+  CARGO_TERM_COLOR: always
+  TAG_NAME: ${{ github.event.release.tag_name }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            exe_ext: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            exe_ext: ".exe"
+          - os: macos-13
+            target: x86_64-apple-darwin
+            exe_ext: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            exe_ext: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux audio dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset_stem="${BIN_NAME}-${TAG_NAME}-${{ matrix.target }}"
+          staging="dist/${asset_stem}"
+          mkdir -p "${staging}"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "${staging}/"
+          cp README.md "${staging}/"
+          if [ -f LICENSE ]; then cp LICENSE "${staging}/"; fi
+          tar -C dist -czf "${asset_stem}.tar.gz" "${asset_stem}"
+          echo "ASSET_PATH=${asset_stem}.tar.gz" >> "${GITHUB_ENV}"
+
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $assetStem = "${env:BIN_NAME}-${env:TAG_NAME}-${{ matrix.target }}"
+          $staging = "dist/$assetStem"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${env:BIN_NAME}${{ matrix.exe_ext }}" $staging
+          Copy-Item README.md $staging
+          if (Test-Path LICENSE) { Copy-Item LICENSE $staging }
+          $assetPath = "$assetStem.zip"
+          Compress-Archive -Path "$staging/*" -DestinationPath $assetPath -Force
+          "ASSET_PATH=$assetPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ASSET_PATH }}
+          if-no-files-found: error
+
+  publish:
+    name: Upload release assets
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download packaged binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Upload release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" release-assets/* --repo "${{ github.repository }}" --clobber

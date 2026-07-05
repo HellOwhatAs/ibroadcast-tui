@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.90"
 license = "MIT"
 description = "Cross-platform terminal client for iBroadcast"
+repository = "https://github.com/HellOwhatAs/ibroadcast-tui"
 
 [dependencies]
 chrono = { version = "0.4", features = ["clock", "serde"] }
