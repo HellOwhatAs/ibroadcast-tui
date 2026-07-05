@@ -1,9 +1,4 @@
-use std::{
-    fs, io,
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{fs, io, path::PathBuf, sync::Arc, time::Duration};
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -116,6 +111,7 @@ enum Action {
     DeleteOrRemove,
     MoveQueueItem(isize),
     ClearQueue,
+    CyclePlaybackMode,
     CyclePlaybackBitrate,
     CycleDownloadBitrate,
     TogglePause,
@@ -354,6 +350,7 @@ impl App {
             },
             Action::MoveQueueItem(delta) => self.move_queue_item(delta),
             Action::ClearQueue => self.clear_queue(),
+            Action::CyclePlaybackMode => self.cycle_playback_mode(),
             Action::CyclePlaybackBitrate => self.cycle_playback_bitrate(),
             Action::CycleDownloadBitrate => self.cycle_download_bitrate(),
             Action::TogglePause => self.toggle_pause(),
@@ -395,7 +392,8 @@ impl App {
 
     fn selected_library_track_id(&self) -> Option<u64> {
         let ids = &self.session.as_ref()?.filtered_track_ids;
-        ids.get(self.selected.min(ids.len().checked_sub(1)?)).copied()
+        ids.get(self.selected.min(ids.len().checked_sub(1)?))
+            .copied()
     }
 
     fn activate_selected(&mut self) {
@@ -584,6 +582,11 @@ impl App {
                 self.config.download_bitrate
             ),
         };
+    }
+
+    fn cycle_playback_mode(&mut self) {
+        let mode = self.queue.cycle_playback_mode();
+        self.status_line = format!("Playback mode set to {mode}");
     }
 
     // ---- playback -------------------------------------------------------
@@ -947,8 +950,10 @@ impl App {
                         self.status_line = "Token saved to system keyring".to_owned();
                     }
                     Ok(TokenPersistence::KeyringWithPlainBackup(path)) => {
-                        self.status_line =
-                            format!("Token saved to keyring; fallback file at {}", path.display());
+                        self.status_line = format!(
+                            "Token saved to keyring; fallback file at {}",
+                            path.display()
+                        );
                     }
                     Ok(TokenPersistence::PlainFile(path)) => {
                         self.status_line =
@@ -973,8 +978,7 @@ impl App {
                 result,
             } => {
                 // Discard events for playback intents that were superseded.
-                if generation != self.playback_generation
-                    || self.playback != PlaybackPhase::Loading
+                if generation != self.playback_generation || self.playback != PlaybackPhase::Loading
                 {
                     return;
                 }
@@ -991,8 +995,7 @@ impl App {
                 label,
                 result,
             } => {
-                if generation != self.playback_generation
-                    || self.playback != PlaybackPhase::Loading
+                if generation != self.playback_generation || self.playback != PlaybackPhase::Loading
                 {
                     return;
                 }
@@ -1112,6 +1115,7 @@ impl App {
                             .current_track()
                             .map(|track_id| ctx.library.track_label(track_id)),
                         playback_bitrate: self.effective_playback_bitrate(),
+                        playback_mode: self.queue.playback_mode(),
                         download_bitrate: self.config.download_bitrate,
                         search_input: self.search_mode.then_some(self.search_input.as_str()),
                     },
@@ -1170,6 +1174,7 @@ fn action_for_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('[') | KeyCode::Char('<') => Action::MoveQueueItem(-1),
         KeyCode::Char(']') | KeyCode::Char('>') => Action::MoveQueueItem(1),
         KeyCode::Char('C') => Action::ClearQueue,
+        KeyCode::Char('m') => Action::CyclePlaybackMode,
         KeyCode::Char('b') => Action::CyclePlaybackBitrate,
         KeyCode::Char('B') => Action::CycleDownloadBitrate,
         KeyCode::Char(' ') => Action::TogglePause,

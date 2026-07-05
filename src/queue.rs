@@ -1,14 +1,63 @@
+use std::fmt;
+
+use rand::Rng;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PlaybackMode {
+    #[default]
+    Sequential,
+    RepeatOne,
+    RepeatAll,
+    Shuffle,
+}
+
+impl PlaybackMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Sequential => Self::RepeatOne,
+            Self::RepeatOne => Self::RepeatAll,
+            Self::RepeatAll => Self::Shuffle,
+            Self::Shuffle => Self::Sequential,
+        }
+    }
+}
+
+impl fmt::Display for PlaybackMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::Sequential => "Sequential",
+            Self::RepeatOne => "Repeat one",
+            Self::RepeatAll => "Repeat all",
+            Self::Shuffle => "Shuffle",
+        };
+        formatter.write_str(label)
+    }
+}
+
 /// The playback queue. A track appears at most once: re-adding an already
 /// queued track is a no-op that yields the existing entry's position.
 #[derive(Clone, Debug, Default)]
 pub struct PlaybackQueue {
     tracks: Vec<u64>,
     current: Option<usize>,
+    mode: PlaybackMode,
+    shuffle_remaining: Vec<usize>,
+    shuffle_history: Vec<usize>,
 }
 
 impl PlaybackQueue {
     pub fn tracks(&self) -> &[u64] {
         &self.tracks
+    }
+
+    pub fn playback_mode(&self) -> PlaybackMode {
+        self.mode
+    }
+
+    pub fn cycle_playback_mode(&mut self) -> PlaybackMode {
+        self.mode = self.mode.next();
+        self.reset_shuffle();
+        self.mode
     }
 
     pub fn current_index(&self) -> Option<usize> {
@@ -20,6 +69,7 @@ impl PlaybackQueue {
             return None;
         }
         self.current = Some(index);
+        self.reset_shuffle();
         self.current_track()
     }
 
@@ -33,6 +83,7 @@ impl PlaybackQueue {
         if self.current.is_none() {
             self.current = Some(0);
         }
+        self.reset_shuffle();
         (self.tracks.len() - 1, true)
     }
 
@@ -58,6 +109,7 @@ impl PlaybackQueue {
             Some(current) if index == current => Some(index.min(self.tracks.len() - 1)),
             Some(current) => Some(current),
         };
+        self.reset_shuffle();
         Some(removed)
     }
 
@@ -71,6 +123,7 @@ impl PlaybackQueue {
             Some(current) if current == index - 1 => Some(index),
             other => other,
         };
+        self.reset_shuffle();
         Some(index - 1)
     }
 
@@ -84,12 +137,14 @@ impl PlaybackQueue {
             Some(current) if current == index + 1 => Some(index),
             other => other,
         };
+        self.reset_shuffle();
         Some(index + 1)
     }
 
     pub fn clear(&mut self) {
         self.tracks.clear();
         self.current = None;
+        self.reset_shuffle();
     }
 
     pub fn len(&self) -> usize {
@@ -106,24 +161,113 @@ impl PlaybackQueue {
     }
 
     pub fn next(&mut self) -> Option<u64> {
+        match self.mode {
+            PlaybackMode::Sequential => self.next_sequential(false),
+            PlaybackMode::RepeatOne => {
+                if self.current.is_none() && !self.tracks.is_empty() {
+                    self.current = Some(0);
+                }
+                self.current_track()
+            }
+            PlaybackMode::RepeatAll => self.next_sequential(true),
+            PlaybackMode::Shuffle => self.next_shuffle(),
+        }
+    }
+
+    pub fn previous(&mut self) -> Option<u64> {
+        match self.mode {
+            PlaybackMode::Sequential | PlaybackMode::RepeatAll => {
+                let current = self.current?;
+                let previous = if current == 0 && self.mode == PlaybackMode::RepeatAll {
+                    self.tracks.len().checked_sub(1)?
+                } else {
+                    current.saturating_sub(1)
+                };
+                self.current = Some(previous);
+                self.current_track()
+            }
+            PlaybackMode::RepeatOne => self.current_track(),
+            PlaybackMode::Shuffle => self.previous_shuffle(),
+        }
+    }
+
+    fn next_sequential(&mut self, wrap: bool) -> Option<u64> {
         let next = self.current.map_or(0, |index| index.saturating_add(1));
         if next >= self.tracks.len() {
+            if wrap && !self.tracks.is_empty() {
+                self.current = Some(0);
+                return self.current_track();
+            }
             return None;
         }
         self.current = Some(next);
         self.current_track()
     }
 
-    pub fn previous(&mut self) -> Option<u64> {
-        let previous = self.current?.saturating_sub(1);
+    fn next_shuffle(&mut self) -> Option<u64> {
+        if self.tracks.is_empty() {
+            self.current = None;
+            return None;
+        }
+        if self.tracks.len() == 1 {
+            self.current = Some(0);
+            return self.current_track();
+        }
+
+        if self.shuffle_remaining.is_empty() {
+            self.refill_shuffle_remaining();
+        }
+        if self.shuffle_remaining.is_empty() {
+            return self.current_track();
+        }
+
+        let slot = rand::rng().random_range(0..self.shuffle_remaining.len());
+        let next = self.shuffle_remaining.swap_remove(slot);
+        if let Some(current) = self.current {
+            self.shuffle_history.push(current);
+        }
+        self.current = Some(next);
+        self.current_track()
+    }
+
+    fn previous_shuffle(&mut self) -> Option<u64> {
+        if self.tracks.is_empty() {
+            self.current = None;
+            return None;
+        }
+
+        let Some(previous) = self.shuffle_history.pop() else {
+            return self.current_track();
+        };
+        if previous >= self.tracks.len() {
+            self.reset_shuffle();
+            return self.current_track();
+        }
+        if let Some(current) = self.current
+            && current < self.tracks.len()
+            && !self.shuffle_remaining.contains(&current)
+        {
+            self.shuffle_remaining.push(current);
+        }
         self.current = Some(previous);
         self.current_track()
+    }
+
+    fn refill_shuffle_remaining(&mut self) {
+        self.shuffle_remaining = (0..self.tracks.len())
+            .filter(|&index| Some(index) != self.current)
+            .collect();
+    }
+
+    fn reset_shuffle(&mut self) {
+        self.shuffle_remaining.clear();
+        self.shuffle_history.clear();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::PlaybackQueue;
+    use super::{PlaybackMode, PlaybackQueue};
 
     #[test]
     fn queue_tracks_advance_and_stop_at_end() {
@@ -184,5 +328,70 @@ mod tests {
         queue.enqueue(10);
         assert_eq!(queue.enqueue_many([10, 20, 20, 30]), 2);
         assert_eq!(queue.tracks(), &[10, 20, 30]);
+    }
+
+    #[test]
+    fn playback_modes_cycle_in_display_order() {
+        let mut queue = PlaybackQueue::default();
+        assert_eq!(queue.playback_mode(), PlaybackMode::Sequential);
+        assert_eq!(queue.cycle_playback_mode(), PlaybackMode::RepeatOne);
+        assert_eq!(queue.cycle_playback_mode(), PlaybackMode::RepeatAll);
+        assert_eq!(queue.cycle_playback_mode(), PlaybackMode::Shuffle);
+        assert_eq!(queue.cycle_playback_mode(), PlaybackMode::Sequential);
+    }
+
+    #[test]
+    fn repeat_one_keeps_the_current_track() {
+        let mut queue = PlaybackQueue::default();
+        queue.enqueue_many([10, 20]);
+        queue.play_index(1);
+        queue.cycle_playback_mode();
+
+        assert_eq!(queue.next(), Some(20));
+        assert_eq!(queue.previous(), Some(20));
+        assert_eq!(queue.current_index(), Some(1));
+    }
+
+    #[test]
+    fn repeat_all_wraps_at_queue_edges() {
+        let mut queue = PlaybackQueue::default();
+        queue.enqueue_many([10, 20]);
+        queue.play_index(1);
+        queue.cycle_playback_mode();
+        queue.cycle_playback_mode();
+
+        assert_eq!(queue.next(), Some(10));
+        assert_eq!(queue.previous(), Some(20));
+    }
+
+    #[test]
+    fn shuffle_keeps_queue_order_and_avoids_repeats_until_cache_is_empty() {
+        let mut queue = PlaybackQueue::default();
+        queue.enqueue_many([10, 20, 30]);
+        queue.play_index(0);
+        queue.cycle_playback_mode();
+        queue.cycle_playback_mode();
+        queue.cycle_playback_mode();
+
+        let first = queue.next();
+        let second = queue.next();
+
+        assert_eq!(queue.tracks(), &[10, 20, 30]);
+        assert_ne!(first, Some(10));
+        assert_ne!(second, Some(10));
+        assert_ne!(second, first);
+    }
+
+    #[test]
+    fn shuffle_previous_uses_play_history() {
+        let mut queue = PlaybackQueue::default();
+        queue.enqueue_many([10, 20]);
+        queue.play_index(0);
+        queue.cycle_playback_mode();
+        queue.cycle_playback_mode();
+        queue.cycle_playback_mode();
+
+        assert_eq!(queue.next(), Some(20));
+        assert_eq!(queue.previous(), Some(10));
     }
 }

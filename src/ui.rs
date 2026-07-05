@@ -10,8 +10,11 @@ use ratatui::{
 };
 
 use crate::{
-    config::Bitrate, downloads::DownloadManager, library::Library, oauth::DeviceCode,
-    queue::PlaybackQueue,
+    config::Bitrate,
+    downloads::DownloadManager,
+    library::Library,
+    oauth::DeviceCode,
+    queue::{PlaybackMode, PlaybackQueue},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,6 +35,7 @@ pub struct ReadyScreen<'a> {
     pub status_line: &'a str,
     pub now_playing: Option<String>,
     pub playback_bitrate: Bitrate,
+    pub playback_mode: PlaybackMode,
     pub download_bitrate: Bitrate,
     /// `Some` while the search prompt is open.
     pub search_input: Option<&'a str>,
@@ -146,8 +150,8 @@ pub fn ready_screen(frame: &mut Frame<'_>, screen: &ReadyScreen<'_>) {
         Line::from(screen.status_line),
         Line::from(format!("Now: {now_playing}")),
         Line::from(format!(
-            "Playback bitrate: {} | Download bitrate: {}",
-            screen.playback_bitrate, screen.download_bitrate
+            "Mode: {} | Playback bitrate: {} | Download bitrate: {}",
+            screen.playback_mode, screen.playback_bitrate, screen.download_bitrate
         )),
         Line::from(format!(
             "Local files: {} | Downloads running: {}",
@@ -161,12 +165,23 @@ pub fn ready_screen(frame: &mut Frame<'_>, screen: &ReadyScreen<'_>) {
     let help = if let Some(search) = screen.search_input {
         format!("Search: {search}")
     } else {
-        "/ search | Enter play | a/A add | d/D download | x delete local/queue | [/ ] move | b/B bitrate | L logout | q quit".to_owned()
+        help_for_view(screen.active_view).to_owned()
     };
     frame.render_widget(Paragraph::new(help), chunks[3]);
 
     if let Some(search) = screen.search_input {
         draw_search_popup(frame, search);
+    }
+}
+
+fn help_for_view(view: View) -> &'static str {
+    match view {
+        View::Library => {
+            "/ search | Enter play | a/A add | d/D download | x delete | b/B bitrate | q quit"
+        }
+        View::Queue => {
+            "Enter play | n/p next/prev | x remove | [/ ] move | C clear | m mode | q quit"
+        }
     }
 }
 
@@ -225,7 +240,10 @@ fn draw_queue(frame: &mut Frame<'_>, area: Rect, screen: &ReadyScreen<'_>) {
             } else {
                 " "
             };
-            ListItem::new(format!("{marker} {}", screen.library.track_label(*track_id)))
+            ListItem::new(format!(
+                "{marker} {}",
+                screen.library.track_label(*track_id)
+            ))
         });
     let mut state = ListState::default();
     if !screen.queue.is_empty() {

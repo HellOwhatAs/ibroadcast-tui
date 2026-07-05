@@ -864,6 +864,7 @@ dependencies = [
  "futures-util",
  "keyring",
  "pretty_assertions",
+ "rand",
  "ratatui",
  "reqwest",
  "rodio",

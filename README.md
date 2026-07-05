@@ -10,7 +10,7 @@ Cross-platform Rust TUI client for [iBroadcast](https://ibroadcast.com/).
 - Token persistence through the system keyring, with a local fallback token file.
 - iBroadcast library sync and compressed `map` decoding.
 - Track browsing and search.
-- Playback queue with play, pause, previous, next, volume controls, and automatic advance to the next queued track. Tracks are queued at most once; re-adding one jumps to its existing entry.
+- Playback queue with play, pause, previous, next, volume controls, sequential/repeat/shuffle modes, and automatic advance. Tracks are queued at most once; re-adding one jumps to its existing entry.
 - Low-latency progressive playback through an in-memory buffer; playback does not write audio to disk.
 - All streaming bitrates: 128 kbps and `orig` stream as plain files, while 96/192/256/320 kbps use the server's HLS endpoints (MPEG-TS segments demuxed to AAC in-process), the same way the official web player requests them.
 - Single-track and visible-list downloads integrated into the Library view.
@@ -69,6 +69,7 @@ The developer page also generates a `client_secret`; most device-code setups onl
 - `x` / `Delete`: delete selected local Library file, or remove selected Queue item
 - `[` / `]`: move selected Queue item up / down
 - `C`: clear Queue
+- `m`: cycle playback mode: sequential, repeat one, repeat all, shuffle
 - `Space`: pause/resume
 - `n` / `p`: next / previous
 - `b`: cycle playback bitrate
