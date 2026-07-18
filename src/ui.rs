@@ -34,6 +34,8 @@ pub struct ReadyScreen<'a> {
     pub active_view: View,
     pub downloads: &'a DownloadManager,
     pub status_line: &'a str,
+    /// Dynamic audio-device status, independent from playback intent.
+    pub audio_warning: Option<&'a str>,
     pub playback: PlaybackSummary,
     pub playback_bitrate: Bitrate,
     pub playback_mode: PlaybackMode,
@@ -52,6 +54,7 @@ pub struct PlaybackSummary {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlaybackState {
     Stopped,
+    WaitingForAudio,
     Loading,
     Playing,
     Paused,
@@ -61,6 +64,7 @@ impl fmt::Display for PlaybackState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let label = match self {
             Self::Stopped => "Stopped",
+            Self::WaitingForAudio => "Waiting for audio",
             Self::Loading => "Loading",
             Self::Playing => "Playing",
             Self::Paused => "Paused",
@@ -137,12 +141,13 @@ pub fn error_screen(frame: &mut Frame<'_>, message: &str) {
 }
 
 pub fn ready_screen(frame: &mut Frame<'_>, screen: &ReadyScreen<'_>) {
+    let status_height = if screen.audio_warning.is_some() { 7 } else { 6 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(5),
-            Constraint::Length(5),
+            Constraint::Length(status_height),
             Constraint::Length(1),
         ])
         .split(frame.area());
@@ -170,8 +175,14 @@ pub fn ready_screen(frame: &mut Frame<'_>, screen: &ReadyScreen<'_>) {
         View::Queue => draw_queue(frame, chunks[1], screen),
     }
 
-    let status = Paragraph::new(vec![
-        Line::from(screen.status_line),
+    let mut status_lines = vec![Line::from(screen.status_line)];
+    if let Some(warning) = screen.audio_warning {
+        status_lines.push(Line::from(Span::styled(
+            format!("Audio: {warning}"),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    status_lines.extend([
         Line::from(playback_status_line(&screen.playback)),
         Line::from(format!(
             "Mode: {} | Playback bitrate: {} | Download bitrate: {}",
@@ -182,8 +193,9 @@ pub fn ready_screen(frame: &mut Frame<'_>, screen: &ReadyScreen<'_>) {
             screen.downloads.local_count(),
             screen.downloads.running_count()
         )),
-    ])
-    .block(Block::default().borders(Borders::ALL).title("Status"));
+    ]);
+    let status =
+        Paragraph::new(status_lines).block(Block::default().borders(Borders::ALL).title("Status"));
     frame.render_widget(Clear, chunks[2]);
     frame.render_widget(status, chunks[2]);
 
