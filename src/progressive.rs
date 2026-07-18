@@ -20,12 +20,17 @@ struct State {
     content_len: Option<u64>,
     finished: bool,
     error: Option<String>,
+    /// Readers capture this value when they are created. Advancing it wakes
+    /// and invalidates only existing readers while preserving buffered data
+    /// and the network feeder for a replacement audio output.
+    reader_epoch: u64,
 }
 
 #[derive(Clone, Debug)]
 pub struct ProgressiveReader {
     shared: Arc<Shared>,
     pos: u64,
+    reader_epoch: u64,
 }
 
 impl ProgressiveBuffer {
@@ -42,10 +47,29 @@ impl ProgressiveBuffer {
     }
 
     pub fn reader(&self) -> ProgressiveReader {
+        let reader_epoch = self
+            .shared
+            .state
+            .lock()
+            .expect("progressive buffer poisoned")
+            .reader_epoch;
         ProgressiveReader {
             shared: Arc::clone(&self.shared),
             pos: 0,
+            reader_epoch,
         }
+    }
+
+    /// Cancels every reader created before this call without failing the
+    /// shared transfer. New readers can immediately reuse all buffered bytes.
+    pub fn cancel_current_readers(&self) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("progressive buffer poisoned");
+        state.reader_epoch = state.reader_epoch.wrapping_add(1);
+        self.shared.changed.notify_all();
     }
 
     pub fn set_content_len(&self, content_len: Option<u64>) {
@@ -98,6 +122,9 @@ impl Read for ProgressiveReader {
 
         let mut state = self.shared.state.lock().map_err(|_| poisoned())?;
         loop {
+            if self.reader_epoch != state.reader_epoch {
+                return Err(reader_cancelled());
+            }
             if let Some(error) = state.error.as_ref()
                 && self.pos >= state.data.len() as u64
             {
@@ -126,6 +153,9 @@ impl Seek for ProgressiveReader {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         let mut state = self.shared.state.lock().map_err(|_| poisoned())?;
         let new_pos = loop {
+            if self.reader_epoch != state.reader_epoch {
+                return Err(reader_cancelled());
+            }
             let len = state.content_len.or_else(|| {
                 if state.finished {
                     Some(state.data.len() as u64)
@@ -163,9 +193,20 @@ fn poisoned() -> io::Error {
     io::Error::other("progressive buffer lock poisoned")
 }
 
+fn reader_cancelled() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::BrokenPipe,
+        "progressive reader replaced by a new audio output",
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::{
+        io::{self, Read, Seek, SeekFrom},
+        sync::mpsc,
+        time::Duration,
+    };
 
     use super::ProgressiveBuffer;
 
@@ -192,5 +233,74 @@ mod tests {
         let mut out = [0; 2];
         assert_eq!(reader.read(&mut out).unwrap(), 2);
         assert_eq!(&out, b"lo");
+    }
+
+    #[test]
+    fn readers_keep_independent_positions() {
+        let buffer = ProgressiveBuffer::new(Some(6));
+        buffer.push(b"abcdef");
+
+        let mut first = buffer.reader();
+        let mut second = buffer.reader();
+        let mut first_out = [0; 2];
+        let mut second_out = [0; 3];
+
+        assert_eq!(first.read(&mut first_out).unwrap(), 2);
+        assert_eq!(&first_out, b"ab");
+        assert_eq!(second.read(&mut second_out).unwrap(), 3);
+        assert_eq!(&second_out, b"abc");
+
+        assert_eq!(first.read(&mut first_out).unwrap(), 2);
+        assert_eq!(&first_out, b"cd");
+        assert_eq!(second.read(&mut second_out[..2]).unwrap(), 2);
+        assert_eq!(&second_out[..2], b"de");
+    }
+
+    #[test]
+    fn replacement_reader_reuses_already_buffered_bytes() {
+        let buffer = ProgressiveBuffer::new(Some(6));
+        buffer.push(b"cached");
+        buffer.finish();
+
+        let mut original = buffer.reader();
+        let mut consumed = [0; 4];
+        assert_eq!(original.read(&mut consumed).unwrap(), 4);
+        assert_eq!(&consumed, b"cach");
+        drop(original);
+
+        // No additional push is needed: a replacement reader starts with an
+        // independent cursor over the bytes retained by the shared buffer.
+        let mut replacement = buffer.reader();
+        let mut replayed = Vec::new();
+        replacement.read_to_end(&mut replayed).unwrap();
+        assert_eq!(replayed, b"cached");
+    }
+
+    #[test]
+    fn cancelling_old_readers_wakes_them_without_discarding_the_buffer() {
+        let buffer = ProgressiveBuffer::new(None);
+        let mut old_reader = buffer.reader();
+        let (tx, rx) = mpsc::channel();
+        let blocked = std::thread::spawn(move || {
+            let mut byte = [0; 1];
+            tx.send(old_reader.read(&mut byte).unwrap_err().kind())
+                .unwrap();
+        });
+
+        buffer.cancel_current_readers();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            io::ErrorKind::BrokenPipe
+        );
+        blocked.join().unwrap();
+
+        // Cancellation is reader-local: the feeder can continue, and a new
+        // output gets all bytes retained by the same buffer.
+        buffer.push(b"still cached");
+        buffer.finish();
+        let mut replacement = buffer.reader();
+        let mut bytes = Vec::new();
+        replacement.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"still cached");
     }
 }

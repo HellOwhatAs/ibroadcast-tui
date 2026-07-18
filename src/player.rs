@@ -11,7 +11,7 @@ use std::{
 };
 
 use rodio::{
-    Decoder, DeviceSinkBuilder, MixerDeviceSink, Player,
+    Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source,
     cpal::{
         self, DeviceId, DeviceIdError,
         traits::{DeviceTrait, HostTrait},
@@ -23,12 +23,11 @@ use crate::{
     progressive::ProgressiveReader,
 };
 
-/// A decoded progressive stream, ready to hand to [`AudioOutput::play_source`].
+/// A decoded source, ready to hand to [`AudioOutput::play_source`].
 ///
-/// Building this can block until enough of the stream has arrived to probe the
-/// container format, so it should happen on a blocking-capable thread, not in
-/// the UI event loop.
-pub type StreamSource = Decoder<BufReader<ProgressiveReader>>;
+/// Building or fast-forwarding this can block, so it should happen on a
+/// blocking-capable thread, not in the UI event loop.
+pub type StreamSource = Box<dyn Source + Send>;
 
 /// The epoch assigned by the application to one physical output stream.
 ///
@@ -139,14 +138,67 @@ pub fn decode_progressive_stream(
     reader: ProgressiveReader,
     mime_type: &str,
     extension_hint: &str,
+    start_at: Duration,
 ) -> Result<StreamSource> {
-    Decoder::builder()
-        .with_data(BufReader::new(reader))
-        .with_hint(extension_hint)
-        .with_mime_type(mime_type)
-        .with_seekable(false)
-        .build()
-        .map_err(|err| AppError::Playback(err.to_string()))
+    let build = |reader| {
+        Decoder::builder()
+            .with_data(BufReader::new(reader))
+            .with_hint(extension_hint)
+            .with_mime_type(mime_type)
+            .with_seekable(false)
+            .build()
+            .map_err(|err| AppError::Playback(err.to_string()))
+    };
+    let fallback_reader = (!start_at.is_zero()).then(|| reader.clone());
+    let mut source = build(reader)?;
+
+    if start_at.is_zero() {
+        return Ok(Box::new(source));
+    }
+    if source.try_seek(start_at).is_ok() {
+        return Ok(Box::new(source));
+    }
+
+    // ProgressiveBuffer retains every byte already received. If the format
+    // cannot perform a forward seek (notably some raw streams), rebuild after
+    // the failed attempt and decode-discard the prefix entirely from memory.
+    let fallback_reader = fallback_reader.expect("nonzero start has a fallback reader");
+    Ok(Box::new(build(fallback_reader)?.skip_duration(start_at)))
+}
+
+/// Reopens a local file at `start_at`, falling back to decoded fast-forwarding
+/// for formats whose demuxer cannot seek directly.
+pub fn decode_file_from(
+    path: &Path,
+    mime_type: &str,
+    extension_hint: &str,
+    start_at: Duration,
+) -> Result<StreamSource> {
+    let build = || {
+        let file = File::open(path)?;
+        let content_len = file.metadata().ok().map(|metadata| metadata.len());
+        let mut builder = Decoder::builder()
+            .with_data(BufReader::new(file))
+            .with_hint(extension_hint)
+            .with_mime_type(mime_type)
+            .with_seekable(true);
+        if let Some(content_len) = content_len {
+            builder = builder.with_byte_len(content_len);
+        }
+        builder
+            .build()
+            .map_err(|err| AppError::Playback(err.to_string()))
+    };
+
+    let mut source = build()?;
+    if start_at.is_zero() || source.try_seek(start_at).is_ok() {
+        return Ok(Box::new(source));
+    }
+
+    // Some codecs expose only forward decoding even for a seekable file.
+    // Rebuild after the failed seek so a partially-mutated decoder is never
+    // reused, then fast-forward on the blocking preparation thread.
+    Ok(Box::new(build()?.skip_duration(start_at)))
 }
 
 /// Thin wrapper around the rodio output device and the currently playing
@@ -155,6 +207,10 @@ pub fn decode_progressive_stream(
 pub struct AudioOutput {
     stream: MixerDeviceSink,
     player: Option<Player>,
+    /// Position within the track at which the currently attached source
+    /// begins. Rebuilt progressive sources report their own position from
+    /// zero, so this keeps the public position continuous across devices.
+    position_base: Duration,
     volume: f32,
     sink_epoch: SinkEpoch,
     device_id: Option<DeviceId>,
@@ -202,6 +258,7 @@ impl AudioOutput {
         Ok(Self {
             stream,
             player: None,
+            position_base: Duration::ZERO,
             volume: 0.8,
             sink_epoch,
             device_id,
@@ -245,43 +302,40 @@ impl AudioOutput {
     /// Success only confirms that the source was attached while the shared
     /// failure flag was clear. Rodio cannot synchronously prove that the
     /// physical stream remains alive.
-    pub fn play_source(&mut self, source: StreamSource) -> Result<()> {
+    pub fn play_source(
+        &mut self,
+        source: StreamSource,
+        position_base: Duration,
+        paused: bool,
+    ) -> Result<()> {
         self.ensure_healthy()?;
         self.stop();
         self.ensure_healthy()?;
         let player = Player::connect_new(self.stream.mixer());
         player.set_volume(self.volume);
+        // Attach while paused so recovery can never leak samples before the
+        // caller's explicit pause state has been applied.
+        player.pause();
         player.append(source);
+        if !paused {
+            player.play();
+        }
         self.ensure_healthy()?;
+        self.position_base = position_base;
         self.player = Some(player);
         Ok(())
     }
 
-    pub fn play_file(&mut self, path: &Path, mime_type: &str, extension_hint: &str) -> Result<()> {
+    pub fn play_file(
+        &mut self,
+        path: &Path,
+        mime_type: &str,
+        extension_hint: &str,
+        paused: bool,
+    ) -> Result<()> {
         self.ensure_healthy()?;
-        let file = File::open(path)?;
-        let content_len = file.metadata().ok().map(|metadata| metadata.len());
-
-        let mut builder = Decoder::builder()
-            .with_data(BufReader::new(file))
-            .with_hint(extension_hint)
-            .with_mime_type(mime_type)
-            .with_seekable(true);
-        if let Some(content_len) = content_len {
-            builder = builder.with_byte_len(content_len);
-        }
-        let source = builder
-            .build()
-            .map_err(|err| AppError::Playback(err.to_string()))?;
-        self.ensure_healthy()?;
-        self.stop();
-        self.ensure_healthy()?;
-        let player = Player::connect_new(self.stream.mixer());
-        player.set_volume(self.volume);
-        player.append(source);
-        self.ensure_healthy()?;
-        self.player = Some(player);
-        Ok(())
+        let source = decode_file_from(path, mime_type, extension_hint, Duration::ZERO)?;
+        self.play_source(source, Duration::ZERO, paused)
     }
 
     /// Idempotently applies an explicit pause state to the loaded track.
@@ -306,13 +360,18 @@ impl AudioOutput {
     }
 
     pub fn position(&self) -> Option<Duration> {
-        self.player.as_ref().map(Player::get_pos)
+        self.player.as_ref().map(|player| {
+            self.position_base
+                .checked_add(player.get_pos())
+                .unwrap_or(Duration::MAX)
+        })
     }
 
     pub fn stop(&mut self) {
         if let Some(player) = self.player.take() {
             player.stop();
         }
+        self.position_base = Duration::ZERO;
     }
 
     pub fn set_volume(&mut self, volume: f32) {
@@ -329,13 +388,56 @@ mod tests {
 
     use rodio::cpal::{BackendSpecificError, StreamError};
 
+    use crate::progressive::ProgressiveBuffer;
+
     use super::*;
+
+    fn mono_pcm_wav(samples: &[i16], sample_rate: u32) -> Vec<u8> {
+        let data_len = std::mem::size_of_val(samples) as u32;
+        let mut wav = Vec::with_capacity(44 + data_len as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        wav.extend_from_slice(&2_u16.to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        for sample in samples {
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+        wav
+    }
 
     #[test]
     fn audio_output_can_cross_a_blocking_worker_boundary() {
         fn assert_send<T: Send>() {}
 
         assert_send::<AudioOutput>();
+    }
+
+    #[test]
+    fn progressive_source_rebuild_fast_forwards_from_the_same_buffer() {
+        let wav = mono_pcm_wav(&[0, 1000, 2000, 3000, 4000, 5000, 6000, 7000], 4);
+        let buffer = ProgressiveBuffer::new(Some(wav.len() as u64));
+        buffer.push(&wav);
+        buffer.finish();
+
+        let original =
+            decode_progressive_stream(buffer.reader(), "audio/wav", "wav", Duration::ZERO).unwrap();
+        assert_eq!(original.count(), 8);
+
+        // A replacement reader sees the retained compressed bytes. Skipping
+        // one second at four mono samples/second leaves the second half, with
+        // no new push and therefore no replacement download.
+        let restored =
+            decode_progressive_stream(buffer.reader(), "audio/wav", "wav", Duration::from_secs(1))
+                .unwrap();
+        assert_eq!(restored.count(), 4);
     }
 
     #[test]
