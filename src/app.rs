@@ -18,7 +18,7 @@ use tokio::{
 };
 
 use crate::{
-    audio::{AudioWorker, AudioWorkerEvent, DefaultOutputProbe},
+    audio::{AudioWorker, AudioWorkerEvent, DefaultOutputProbe, OutputDeviceProbe},
     config::{Bitrate, Config},
     downloads::{
         DownloadManager, build_download_path, download_to_file, extension_from_mime,
@@ -29,8 +29,8 @@ use crate::{
     library::{Library, Track},
     oauth::{self, DeviceCode, TokenSet},
     player::{
-        AudioOutput, AudioStreamEvent, SinkEpoch, StreamSource, decode_file_from,
-        decode_progressive_stream,
+        AudioOutput, AudioStreamEvent, DecodeCancellation, SinkEpoch, StreamSource,
+        decode_file_from_cancellable, decode_progressive_stream,
     },
     progressive::ProgressiveBuffer,
     queue::PlaybackQueue,
@@ -43,6 +43,7 @@ const SCOPES: &[&str] = &["user.library:read", "user.account:read"];
 const AUDIO_PROBE_INTERVAL: Duration = Duration::from_millis(750);
 const AUDIO_RETRY_MAX: Duration = Duration::from_secs(5);
 const AUDIO_STABLE_RESET_AFTER: Duration = Duration::from_secs(10);
+const AUDIO_UNDERRUN_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct App {
     config: Config,
@@ -69,6 +70,7 @@ pub struct App {
     next_audio_probe: u64,
     audio_probe_in_flight: Option<(u64, Option<u64>)>,
     next_audio_probe_at: Instant,
+    next_audio_underrun_log_at: Instant,
     desired_playback: DesiredPlayback,
     playback: PlaybackPhase,
     /// Incremented whenever playback intent changes; stale stream events are
@@ -78,6 +80,8 @@ pub struct App {
     /// It is cleared by every explicit track/stop intent.
     playback_checkpoint: Option<PlaybackCheckpoint>,
     stream_task: Option<StreamTask>,
+    local_restore_task: Option<LocalRestoreTask>,
+    next_local_restore_task_id: u64,
     queue: PlaybackQueue,
     downloads: DownloadManager,
     status_line: String,
@@ -97,6 +101,33 @@ struct StreamTask {
     label: String,
     mime_type: String,
     extension_hint: String,
+}
+
+/// One cancellable local-file decoder being prepared for a replacement output.
+///
+/// Aborting a started blocking task is not sufficient, so dropping this guard
+/// also signals the reader/source cooperatively. A completed task is disarmed
+/// before its prepared source is installed.
+struct LocalRestoreTask {
+    id: u64,
+    cancellation: DecodeCancellation,
+    handle: JoinHandle<()>,
+    cancel_on_drop: bool,
+}
+
+impl LocalRestoreTask {
+    fn disarm(mut self) {
+        self.cancel_on_drop = false;
+    }
+}
+
+impl Drop for LocalRestoreTask {
+    fn drop(&mut self) {
+        if self.cancel_on_drop {
+            self.cancellation.cancel();
+            self.handle.abort();
+        }
+    }
 }
 
 /// State that exists only while logged in with a synced library.
@@ -157,6 +188,12 @@ struct PlaybackCheckpoint {
     position: Duration,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlaybackCheckpointUpdate {
+    checkpoint: Option<PlaybackCheckpoint>,
+    newly_created: bool,
+}
+
 impl DesiredPlayback {
     const fn track_id(self) -> Option<u64> {
         match self {
@@ -198,30 +235,48 @@ fn reduce_desired_playback(
 }
 
 /// Captures an active track once and keeps that exact point through rapid
-/// output changes. A replacement output has no player yet, so its apparent
-/// zero position must never overwrite the original checkpoint.
+/// output changes. A retained stream that is still loading checkpoints at
+/// zero so its feeder and buffered bytes can survive the replacement. Once a
+/// checkpoint exists, a replacement output's apparent zero position must not
+/// overwrite it.
 fn checkpoint_after_audio_loss(
     existing: Option<PlaybackCheckpoint>,
     phase: PlaybackPhase,
     desired: DesiredPlayback,
     generation: u64,
     position: Option<Duration>,
-) -> Option<PlaybackCheckpoint> {
-    let track_id = desired.track_id()?;
+    has_matching_retained_stream: bool,
+) -> PlaybackCheckpointUpdate {
+    let Some(track_id) = desired.track_id() else {
+        return PlaybackCheckpointUpdate {
+            checkpoint: None,
+            newly_created: false,
+        };
+    };
     if let Some(checkpoint) = existing
         && checkpoint.generation == generation
         && checkpoint.track_id == track_id
     {
-        return Some(checkpoint);
+        return PlaybackCheckpointUpdate {
+            checkpoint: Some(checkpoint),
+            newly_created: false,
+        };
     }
-    if phase != PlaybackPhase::Active {
-        return None;
-    }
-    position.map(|position| PlaybackCheckpoint {
+
+    let position = match phase {
+        PlaybackPhase::Active => position,
+        PlaybackPhase::Loading if has_matching_retained_stream => Some(Duration::ZERO),
+        PlaybackPhase::Idle | PlaybackPhase::WaitingForAudio | PlaybackPhase::Loading => None,
+    };
+    let checkpoint = position.map(|position| PlaybackCheckpoint {
         generation,
         track_id,
         position,
-    })
+    });
+    PlaybackCheckpointUpdate {
+        checkpoint,
+        newly_created: checkpoint.is_some(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -388,6 +443,8 @@ enum BackendEvent {
     StreamDecoded {
         generation: u64,
         track_id: u64,
+        /// Identifies a cancellable local-file restoration task, when present.
+        local_restore_task_id: Option<u64>,
         /// Present only when rebuilding on a replacement physical output.
         sink_epoch: Option<SinkEpoch>,
         position_base: Duration,
@@ -444,11 +501,14 @@ impl App {
             next_audio_probe: 0,
             audio_probe_in_flight: None,
             next_audio_probe_at: Instant::now(),
+            next_audio_underrun_log_at: Instant::now(),
             desired_playback: DesiredPlayback::Stopped,
             playback: PlaybackPhase::Idle,
             playback_generation: 0,
             playback_checkpoint: None,
             stream_task: None,
+            local_restore_task: None,
+            next_local_restore_task_id: 0,
             queue,
             downloads: DownloadManager::default(),
             status_line: String::new(),
@@ -481,6 +541,7 @@ impl App {
     /// charge (for example when the device changes while a URL is still being
     /// resolved).
     fn checkpoint_playback_for_audio_recovery(&mut self) -> bool {
+        self.cancel_local_restore_task();
         let position = match &mut self.audio {
             AudioState::Ready(output) => {
                 output.set_paused(true);
@@ -488,17 +549,25 @@ impl App {
             }
             AudioState::Opening { .. } | AudioState::Unavailable { .. } => None,
         };
-        self.playback_checkpoint = checkpoint_after_audio_loss(
+        let desired_track = self.desired_playback.track_id();
+        let has_matching_retained_stream = self.stream_task.as_ref().is_some_and(|task| {
+            task.generation == self.playback_generation && Some(task.track_id) == desired_track
+        });
+        let update = checkpoint_after_audio_loss(
             self.playback_checkpoint,
             self.playback,
             self.desired_playback,
             self.playback_generation,
             position,
+            has_matching_retained_stream,
         );
+        self.playback_checkpoint = update.checkpoint;
 
         if let Some(checkpoint) = self.playback_checkpoint {
-            self.desired_playback =
-                reduce_desired_playback(self.desired_playback, DesiredPlaybackAction::Pause);
+            if update.newly_created {
+                self.desired_playback =
+                    reduce_desired_playback(self.desired_playback, DesiredPlaybackAction::Pause);
+            }
             if let Some(task) = self.stream_task.as_ref()
                 && task.generation == checkpoint.generation
                 && task.track_id == checkpoint.track_id
@@ -587,6 +656,7 @@ impl App {
     }
 
     fn invalidate_playback_pipeline_for_audio_loss(&mut self) {
+        self.cancel_local_restore_task();
         self.playback_generation = self.playback_generation.wrapping_add(1);
         self.cancel_stream_task();
         self.playback = if self.desired_playback.track_id().is_some() {
@@ -626,9 +696,10 @@ impl App {
             AudioWorkerEvent::ProbeFinished {
                 probe_id,
                 sink_epoch,
+                opened_device,
                 result,
             } => {
-                self.handle_audio_probe_finished(probe_id, sink_epoch, result);
+                self.handle_audio_probe_finished(probe_id, sink_epoch, opened_device, result);
             }
             AudioWorkerEvent::Stream(event) => self.handle_audio_stream_event(event),
         }
@@ -700,6 +771,7 @@ impl App {
         &mut self,
         probe_id: u64,
         sink_epoch: Option<u64>,
+        opened_device: Option<OutputDeviceProbe>,
         result: DefaultOutputProbe,
     ) {
         let current_epoch = match &self.audio {
@@ -724,8 +796,13 @@ impl App {
             }
         }
 
-        let ready_candidate = match &self.audio {
-            AudioState::Ready(output) => Some(classify_audio_candidate(output, &result)),
+        let ready_candidate = match &mut self.audio {
+            AudioState::Ready(output) => {
+                if let Some(OutputDeviceProbe::Available(device_id)) = opened_device.as_ref() {
+                    output.remember_device_id(device_id.clone());
+                }
+                Some(classify_audio_candidate(output, &result))
+            }
             AudioState::Opening { .. } | AudioState::Unavailable { .. } => None,
         };
         if let Some(candidate) = ready_candidate {
@@ -775,17 +852,22 @@ impl App {
                 "audio output failed"
             );
             self.begin_audio_failure_recovery(format!("{}; reconnecting...", event.error));
-        } else {
-            tracing::warn!(
-                sink_epoch = event.sink_epoch,
-                error = %event.error,
-                "non-fatal audio output warning"
-            );
         }
     }
 
     fn tick_audio_lifecycle(&mut self) {
         let now = Instant::now();
+        if now >= self.next_audio_underrun_log_at {
+            self.next_audio_underrun_log_at = now + AUDIO_UNDERRUN_LOG_INTERVAL;
+            if let AudioState::Ready(output) = &self.audio
+                && output.take_buffer_underrun()
+            {
+                tracing::warn!(
+                    sink_epoch = output.sink_epoch(),
+                    "audio buffer underrun or overrun (coalesced)"
+                );
+            }
+        }
         if matches!(self.audio, AudioState::Ready(_))
             && self
                 .audio_ready_since
@@ -812,13 +894,13 @@ impl App {
 
         self.next_audio_probe = self.next_audio_probe.wrapping_add(1).max(1);
         let probe_id = self.next_audio_probe;
-        let sink_epoch = match &self.audio {
-            AudioState::Ready(output) => Some(output.sink_epoch()),
-            AudioState::Opening { .. } | AudioState::Unavailable { .. } => None,
+        let (sink_epoch, opened_device) = match &self.audio {
+            AudioState::Ready(output) => (Some(output.sink_epoch()), Some(output.output_device())),
+            AudioState::Opening { .. } | AudioState::Unavailable { .. } => (None, None),
         };
         self.audio_probe_in_flight = Some((probe_id, sink_epoch));
         self.next_audio_probe_at = now + AUDIO_PROBE_INTERVAL;
-        self.audio_worker.probe(probe_id, sink_epoch);
+        self.audio_worker.probe(probe_id, sink_epoch, opened_device);
     }
 
     pub async fn run(mut self) -> Result<()> {
@@ -1298,6 +1380,23 @@ impl App {
 
     // ---- playback -------------------------------------------------------
 
+    fn cancel_local_restore_task(&mut self) {
+        drop(self.local_restore_task.take());
+    }
+
+    fn complete_local_restore_task(&mut self, task_id: u64) {
+        if self
+            .local_restore_task
+            .as_ref()
+            .is_some_and(|task| task.id == task_id)
+        {
+            self.local_restore_task
+                .take()
+                .expect("matching local restore task checked above")
+                .disarm();
+        }
+    }
+
     /// Rebuilds the current source on the newly opened output without
     /// restarting its transfer. The prepared source is tagged with both the
     /// playback generation and sink epoch so rapid device changes cannot
@@ -1346,6 +1445,7 @@ impl App {
                 let _ = tx.send(BackendEvent::StreamDecoded {
                     generation: checkpoint.generation,
                     track_id: checkpoint.track_id,
+                    local_restore_task_id: None,
                     sink_epoch: Some(sink_epoch),
                     position_base: checkpoint.position,
                     label,
@@ -1353,7 +1453,7 @@ impl App {
                 });
             });
             self.playback = PlaybackPhase::WaitingForAudio;
-            self.status_line = "Audio output changed; restoring paused playback...".to_owned();
+            self.status_line = "Audio output changed; restoring playback...".to_owned();
             return;
         }
 
@@ -1389,20 +1489,41 @@ impl App {
             return;
         };
 
+        self.cancel_local_restore_task();
+        self.next_local_restore_task_id = self.next_local_restore_task_id.wrapping_add(1).max(1);
+        let task_id = self.next_local_restore_task_id;
+        let cancellation = DecodeCancellation::new();
+        let worker_cancellation = cancellation.clone();
         let tx = self.tx.clone();
-        tokio::task::spawn_blocking(move || {
-            let result = decode_file_from(&path, &mime_type, &extension_hint, checkpoint.position);
+        let handle = tokio::task::spawn_blocking(move || {
+            let result = decode_file_from_cancellable(
+                &path,
+                &mime_type,
+                &extension_hint,
+                checkpoint.position,
+                worker_cancellation.clone(),
+            );
+            if worker_cancellation.is_cancelled() {
+                return;
+            }
             let _ = tx.send(BackendEvent::StreamDecoded {
                 generation: checkpoint.generation,
                 track_id: checkpoint.track_id,
+                local_restore_task_id: Some(task_id),
                 sink_epoch: Some(sink_epoch),
                 position_base: checkpoint.position,
                 label,
                 result,
             });
         });
+        self.local_restore_task = Some(LocalRestoreTask {
+            id: task_id,
+            cancellation,
+            handle,
+            cancel_on_drop: true,
+        });
         self.playback = PlaybackPhase::WaitingForAudio;
-        self.status_line = "Audio output changed; restoring paused playback...".to_owned();
+        self.status_line = "Audio output changed; restoring playback...".to_owned();
     }
 
     /// Records a new user playback intent for the queue's current track.
@@ -1426,6 +1547,7 @@ impl App {
 
     /// Starts the physical playback pipeline for the latest desired track.
     fn start_desired_track(&mut self) {
+        self.cancel_local_restore_task();
         self.playback_checkpoint = None;
         self.playback_generation = self.playback_generation.wrapping_add(1);
         let generation = self.playback_generation;
@@ -1605,6 +1727,7 @@ impl App {
             let _ = tx.send(BackendEvent::StreamDecoded {
                 generation,
                 track_id,
+                local_restore_task_id: None,
                 sink_epoch: None,
                 position_base: Duration::ZERO,
                 label,
@@ -1643,6 +1766,7 @@ impl App {
     }
 
     fn stop_requested_playback(&mut self) {
+        self.cancel_local_restore_task();
         self.desired_playback =
             reduce_desired_playback(self.desired_playback, DesiredPlaybackAction::Stop);
         self.playback = PlaybackPhase::Idle;
@@ -1879,11 +2003,15 @@ impl App {
             BackendEvent::StreamDecoded {
                 generation,
                 track_id,
+                local_restore_task_id,
                 sink_epoch,
                 position_base,
                 label,
                 result,
             } => {
+                if let Some(task_id) = local_restore_task_id {
+                    self.complete_local_restore_task(task_id);
+                }
                 let restoring = sink_epoch.is_some();
                 let current_sink_epoch = match &self.audio {
                     AudioState::Ready(output) => Some(output.sink_epoch()),
@@ -2074,7 +2202,9 @@ impl App {
     fn playback_state(&self) -> ui::PlaybackState {
         match self.playback {
             PlaybackPhase::Idle => ui::PlaybackState::Stopped,
-            PlaybackPhase::WaitingForAudio if self.playback_checkpoint.is_some() => {
+            PlaybackPhase::WaitingForAudio
+                if self.playback_checkpoint.is_some() && self.desired_playback.paused() =>
+            {
                 ui::PlaybackState::Paused
             }
             PlaybackPhase::WaitingForAudio => ui::PlaybackState::WaitingForAudio,
@@ -2292,13 +2422,24 @@ mod tests {
         };
         let position = Duration::from_secs(73);
 
+        let update = checkpoint_after_audio_loss(
+            None,
+            PlaybackPhase::Active,
+            desired,
+            11,
+            Some(position),
+            false,
+        );
         assert_eq!(
-            checkpoint_after_audio_loss(None, PlaybackPhase::Active, desired, 11, Some(position),),
-            Some(PlaybackCheckpoint {
-                generation: 11,
-                track_id: 42,
-                position,
-            })
+            update,
+            PlaybackCheckpointUpdate {
+                checkpoint: Some(PlaybackCheckpoint {
+                    generation: 11,
+                    track_id: 42,
+                    position,
+                }),
+                newly_created: true,
+            }
         );
         let paused = reduce_desired_playback(desired, DesiredPlaybackAction::Pause);
         assert_eq!(
@@ -2336,8 +2477,12 @@ mod tests {
                 desired,
                 7,
                 Some(Duration::ZERO),
+                false,
             ),
-            Some(original)
+            PlaybackCheckpointUpdate {
+                checkpoint: Some(original),
+                newly_created: false,
+            }
         );
         assert_eq!(
             checkpoint_after_audio_loss(
@@ -2346,13 +2491,17 @@ mod tests {
                 desired,
                 7,
                 None,
+                false,
             ),
-            Some(original)
+            PlaybackCheckpointUpdate {
+                checkpoint: Some(original),
+                newly_created: false,
+            }
         );
     }
 
     #[test]
-    fn only_active_playback_creates_a_new_audio_checkpoint() {
+    fn only_active_or_retained_loading_playback_creates_a_new_audio_checkpoint() {
         let desired = DesiredPlayback::Track {
             track_id: 3,
             paused: false,
@@ -2363,10 +2512,63 @@ mod tests {
             PlaybackPhase::Loading,
         ] {
             assert_eq!(
-                checkpoint_after_audio_loss(None, phase, desired, 5, Some(Duration::from_secs(8)),),
-                None
+                checkpoint_after_audio_loss(
+                    None,
+                    phase,
+                    desired,
+                    5,
+                    Some(Duration::from_secs(8)),
+                    false,
+                ),
+                PlaybackCheckpointUpdate {
+                    checkpoint: None,
+                    newly_created: false,
+                }
             );
         }
+
+        assert_eq!(
+            checkpoint_after_audio_loss(None, PlaybackPhase::Loading, desired, 5, None, true,),
+            PlaybackCheckpointUpdate {
+                checkpoint: Some(PlaybackCheckpoint {
+                    generation: 5,
+                    track_id: 3,
+                    position: Duration::ZERO,
+                }),
+                newly_created: true,
+            }
+        );
+    }
+
+    #[test]
+    fn reusing_a_checkpoint_preserves_the_users_latest_playback_intent() {
+        let checkpoint = PlaybackCheckpoint {
+            generation: 12,
+            track_id: 7,
+            position: Duration::from_secs(41),
+        };
+        let resumed = DesiredPlayback::Track {
+            track_id: 7,
+            paused: false,
+        };
+
+        let update = checkpoint_after_audio_loss(
+            Some(checkpoint),
+            PlaybackPhase::WaitingForAudio,
+            resumed,
+            12,
+            None,
+            false,
+        );
+
+        assert_eq!(update.checkpoint, Some(checkpoint));
+        assert!(!update.newly_created);
+        let final_intent = if update.newly_created {
+            reduce_desired_playback(resumed, DesiredPlaybackAction::Pause)
+        } else {
+            resumed
+        };
+        assert_eq!(final_intent, resumed);
     }
 
     #[test]
@@ -2443,6 +2645,53 @@ mod tests {
     }
 
     #[test]
+    fn retained_loading_source_only_accepts_the_replacement_sink_decoder() {
+        let checkpoint = Some(PlaybackCheckpoint {
+            generation: 6,
+            track_id: 15,
+            position: Duration::ZERO,
+        });
+        let desired = DesiredPlayback::Track {
+            track_id: 15,
+            paused: true,
+        };
+
+        assert!(decoded_source_is_current(
+            6,
+            15,
+            Some(31),
+            Duration::ZERO,
+            6,
+            PlaybackPhase::WaitingForAudio,
+            desired,
+            checkpoint,
+            Some(31),
+        ));
+        assert!(!decoded_source_is_current(
+            6,
+            15,
+            None,
+            Duration::ZERO,
+            6,
+            PlaybackPhase::WaitingForAudio,
+            desired,
+            checkpoint,
+            Some(31),
+        ));
+        assert!(!decoded_source_is_current(
+            6,
+            15,
+            Some(30),
+            Duration::ZERO,
+            6,
+            PlaybackPhase::WaitingForAudio,
+            desired,
+            checkpoint,
+            Some(31),
+        ));
+    }
+
+    #[test]
     fn only_current_open_attempt_can_be_installed() {
         let state = AudioState::Opening {
             attempt_id: 12,
@@ -2500,10 +2749,20 @@ mod tests {
             AudioCandidate::Accept
         );
         // If the opened endpoint's ID itself was unavailable, retain the
-        // successfully opened sink and rely on later best-effort probes.
+        // successfully opened sink for this attempt. Later probes re-query the
+        // exact opened device handle instead of treating None as permanent.
         assert_eq!(
             classify_audio_candidate_state(true, None, Ok(Some(&device))),
             AudioCandidate::Accept
+        );
+        assert_eq!(
+            classify_audio_candidate_state(true, Some(&device), Ok(Some(&device))),
+            AudioCandidate::Accept
+        );
+        let replacement = "device-b";
+        assert_eq!(
+            classify_audio_candidate_state(true, Some(&device), Ok(Some(&replacement))),
+            AudioCandidate::DefaultChanged
         );
     }
 

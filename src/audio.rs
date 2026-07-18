@@ -1,9 +1,12 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    mem::ManuallyDrop,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
-use rodio::cpal::DeviceId;
+use rodio::cpal::{self, DeviceId, traits::DeviceTrait};
 use tokio::{
     sync::{mpsc, oneshot},
     task::{self, JoinHandle},
@@ -35,6 +38,25 @@ impl DefaultOutputProbe {
     }
 }
 
+/// A best-effort identity query against the device that backs an open stream.
+///
+/// Unlike [`DefaultOutputProbe`], this cannot be `Unavailable`: the probe owns
+/// a clone of the exact device handle selected while the stream was opened.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OutputDeviceProbe {
+    Available(DeviceId),
+    Failed(String),
+}
+
+impl OutputDeviceProbe {
+    fn query(device: &cpal::Device) -> Self {
+        match device.id() {
+            Ok(device_id) => Self::Available(device_id),
+            Err(error) => Self::Failed(error.to_string()),
+        }
+    }
+}
+
 pub enum AudioWorkerEvent {
     OpenFinished {
         attempt_id: u64,
@@ -44,6 +66,7 @@ pub enum AudioWorkerEvent {
     ProbeFinished {
         probe_id: u64,
         sink_epoch: Option<SinkEpoch>,
+        opened_device: Option<OutputDeviceProbe>,
         result: DefaultOutputProbe,
     },
     Stream(AudioStreamEvent),
@@ -57,6 +80,7 @@ enum AudioWorkerCommand {
     Probe {
         probe_id: u64,
         sink_epoch: Option<SinkEpoch>,
+        opened_device: Option<cpal::Device>,
     },
     Dispose(AudioOutput),
     Shutdown {
@@ -145,12 +169,15 @@ impl AudioWorker {
                     AudioWorkerCommand::Probe {
                         probe_id,
                         sink_epoch,
+                        opened_device,
                     } => {
+                        let opened_device = opened_device.as_ref().map(OutputDeviceProbe::query);
                         let result = DefaultOutputProbe::query();
                         if event_tx
                             .send(AudioWorkerEvent::ProbeFinished {
                                 probe_id,
                                 sink_epoch,
+                                opened_device,
                                 result,
                             })
                             .is_err()
@@ -197,37 +224,37 @@ impl AudioWorker {
         // The worker lives as long as App. If it has unexpectedly exited,
         // playback cannot recover and panicking is preferable to silently
         // dropping a platform stream on the UI thread.
-        if self
-            .commands
-            .send(AudioWorkerCommand::Open {
+        if !send_or_drop_off_thread(
+            &self.commands,
+            AudioWorkerCommand::Open {
                 attempt_id,
                 previous,
-            })
-            .is_err()
-        {
+            },
+        ) {
             panic!("audio worker unexpectedly stopped");
         }
     }
 
-    pub fn probe(&self, probe_id: u64, sink_epoch: Option<SinkEpoch>) {
-        if self
-            .commands
-            .send(AudioWorkerCommand::Probe {
+    pub fn probe(
+        &self,
+        probe_id: u64,
+        sink_epoch: Option<SinkEpoch>,
+        opened_device: Option<cpal::Device>,
+    ) {
+        if !send_or_drop_off_thread(
+            &self.commands,
+            AudioWorkerCommand::Probe {
                 probe_id,
                 sink_epoch,
-            })
-            .is_err()
-        {
+                opened_device,
+            },
+        ) {
             panic!("audio worker unexpectedly stopped");
         }
     }
 
     pub fn dispose(&self, output: AudioOutput) {
-        if self
-            .commands
-            .send(AudioWorkerCommand::Dispose(output))
-            .is_err()
-        {
+        if !send_or_drop_off_thread(&self.commands, AudioWorkerCommand::Dispose(output)) {
             panic!("audio worker unexpectedly stopped");
         }
     }
@@ -244,16 +271,18 @@ impl AudioWorker {
             current,
             acknowledged,
         }) {
-            // An unexpected worker exit must still avoid destroying a stream
-            // on the caller/UI thread.
+            // Close the acknowledgement on this thread so a failure to create
+            // the fallback drop thread cannot leave shutdown waiting forever.
+            // Only the platform output itself needs off-thread destruction.
             if let AudioWorkerCommand::Shutdown {
-                current: Some(output),
-                ..
+                current,
+                acknowledged,
             } = error.0
             {
-                let _ = std::thread::Builder::new()
-                    .name("audio-output-drop".to_owned())
-                    .spawn(move || drop(output));
+                drop(acknowledged);
+                if let Some(output) = current {
+                    drop_off_thread(output);
+                }
             }
         }
         receiver
@@ -266,6 +295,41 @@ impl Drop for AudioWorker {
         // the orderly App shutdown. An in-progress open will keep its result
         // on this blocking worker instead of publishing a new candidate.
         self.shutting_down.store(true, Ordering::Release);
+    }
+}
+
+/// Sends an owned command, keeping destruction of a rejected value off the
+/// caller thread when the worker has unexpectedly stopped.
+fn send_or_drop_off_thread<T>(sender: &mpsc::UnboundedSender<T>, value: T) -> bool
+where
+    T: Send + 'static,
+{
+    match sender.send(value) {
+        Ok(()) => true,
+        Err(error) => {
+            drop_off_thread(error.0);
+            false
+        }
+    }
+}
+
+fn drop_off_thread<T>(value: T)
+where
+    T: Send + 'static,
+{
+    // If the OS refuses to create the fallback thread, dropping its closure
+    // must still not destroy a platform stream on the caller thread.
+    // `ManuallyDrop` deliberately leaks the rejected value in that exceptional
+    // case.
+    let value = ManuallyDrop::new(value);
+    if let Err(error) = std::thread::Builder::new()
+        .name("audio-output-drop".to_owned())
+        .spawn(move || drop(ManuallyDrop::into_inner(value)))
+    {
+        tracing::error!(
+            error = %error,
+            "could not start fallback audio drop thread; leaking rejected value"
+        );
     }
 }
 
@@ -286,7 +350,26 @@ fn shutdown_can_finish(shutdown_requested: bool, leased_epoch: Option<SinkEpoch>
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::mpsc as std_mpsc,
+        thread::{self, ThreadId},
+        time::Duration,
+    };
+
     use super::*;
+
+    struct DropProbe {
+        dropped: std_mpsc::Sender<(ThreadId, Option<String>)>,
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            let current = thread::current();
+            let _ = self
+                .dropped
+                .send((current.id(), current.name().map(str::to_owned)));
+        }
+    }
 
     #[test]
     fn shutdown_waits_until_the_exact_candidate_lease_is_returned() {
@@ -312,5 +395,42 @@ mod tests {
             .await
             .expect("audio worker shutdown timed out")
             .expect("audio worker dropped its acknowledgement");
+    }
+
+    #[tokio::test]
+    async fn closed_worker_cannot_leave_shutdown_acknowledgement_pending() {
+        let (commands, command_rx) = mpsc::unbounded_channel();
+        drop(command_rx);
+        let worker = AudioWorker {
+            commands,
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            _task: tokio::spawn(async {}),
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(1), worker.shutdown(None))
+            .await
+            .expect("closed worker left shutdown acknowledgement pending");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn failed_send_drops_the_rejected_value_on_the_named_fallback_thread() {
+        let caller = thread::current().id();
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        drop(command_rx);
+        let (dropped_tx, dropped_rx) = std_mpsc::channel();
+
+        assert!(!send_or_drop_off_thread(
+            &command_tx,
+            DropProbe {
+                dropped: dropped_tx,
+            },
+        ));
+
+        let (drop_thread, drop_thread_name) = dropped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("rejected value was not dropped");
+        assert_ne!(drop_thread, caller);
+        assert_eq!(drop_thread_name.as_deref(), Some("audio-output-drop"));
     }
 }
